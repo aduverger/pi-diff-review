@@ -4,8 +4,13 @@
   "version": "0.2.0",
   "type": "module",
   "scripts": {
-    "check": "tsgo --noEmit",
-    "prepare": "husky"
+    "typecheck": "tsc --noEmit",
+    "check:web": "node --check web/review-state.js && node --check web/app.js",
+    "test": "node --experimental-strip-types --test test/*.test.mjs",
+    "check": "npm run typecheck && npm run check:web && npm test"
+  },
+  "engines": {
+    "node": ">=22.19.0"
   },
   "pi": {
     "extensions": [
@@ -16,12 +21,21 @@
     "glimpseui": "^0.8.1"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    }
   },
   "devDependencies": {
-    "@types/node": "^24.5.2",
-    "@typescript/native-preview": "^7.0.0-dev.20260313.1",
-    "husky": "^9.1.7",
-    "typescript": "^5.9.2"
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@earendil-works/pi-tui": "0.84.2",
+    "@types/node": "22.20.1",
+    "typescript": "7.0.2"
   }
 }

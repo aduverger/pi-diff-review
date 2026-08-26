@@ -1,46 +1,94 @@
-export type ReviewScope = "git-diff" | "last-commit" | "commit" | "all-files";
+export type ReviewMode = "uncommitted" | "compare";
 
-export type ChangeStatus = "modified" | "added" | "deleted" | "renamed";
+export type ChangeStatus =
+  | "modified"
+  | "added"
+  | "deleted"
+  | "renamed"
+  | "copied"
+  | "type-changed"
+  | "conflicted";
 
-export interface ReviewFileComparison {
-  status: ChangeStatus;
-  oldPath: string | null;
-  newPath: string | null;
-  displayPath: string;
-  hasOriginal: boolean;
-  hasModified: boolean;
+export interface DiscoveredRepository {
+  id: string;
+  root: string;
+  workspacePath: string;
+  name: string;
 }
 
-export interface ReviewCommit {
-  sha: string;
-  shortSha: string;
-  subject: string;
+export interface ReviewContext {
+  key: string;
+  mode: ReviewMode;
+  repositoryId: string;
+  baseRef?: string;
+  headRef?: string;
+  baseOid?: string;
+  headOid?: string;
+  mergeBaseOid?: string;
 }
 
 export interface ReviewFile {
   id: string;
-  path: string;
-  worktreeStatus: ChangeStatus | null;
-  hasWorkingTreeFile: boolean;
-  inGitDiff: boolean;
-  inLastCommit: boolean;
-  gitDiff: ReviewFileComparison | null;
-  lastCommit: ReviewFileComparison | null;
-  commitComparisons: Record<string, ReviewFileComparison>;
+  repositoryId: string;
+  workspacePath: string;
+  status: ChangeStatus;
+  oldPath: string | null;
+  newPath: string | null;
+  displayPath: string;
+  oldMode: string | null;
+  newMode: string | null;
+  oldOid: string | null;
+  newOid: string | null;
+  submoduleState: string | null;
 }
 
+export interface ReviewChangeSet {
+  context: ReviewContext;
+  files: ReviewFile[];
+}
+
+export interface ReviewRepositoryData {
+  id: string;
+  name: string;
+  workspacePath: string;
+  baseRef: string | null;
+  headRef: "HEAD";
+  headOid: string | null;
+  uncommitted: ReviewChangeSet | null;
+  error?: string;
+}
+
+export interface ReviewComparisonData {
+  repositoryId: string;
+  baseRef: string;
+  headRef: string;
+  baseOid: string;
+  headOid: string;
+  mergeBaseOid: string;
+  changeSet: ReviewChangeSet;
+}
+
+export type ReviewContent =
+  | { kind: "text"; text: string }
+  | { kind: "binary"; byteLength?: number }
+  | { kind: "symlink"; text: string }
+  | { kind: "gitlink"; text: string }
+  | { kind: "special"; message: string }
+  | { kind: "missing" };
+
 export interface ReviewFileContents {
-  originalContent: string;
-  modifiedContent: string;
+  original: ReviewContent;
+  modified: ReviewContent;
 }
 
 export type CommentSide = "original" | "modified" | "file";
 
 export interface DiffReviewComment {
   id: string;
+  repositoryId: string;
+  contextKey: string;
   fileId: string;
-  scope: ReviewScope;
-  commitSha?: string;
+  mode: ReviewMode;
   side: CommentSide;
   startLine: number | null;
   endLine: number | null;
@@ -57,39 +105,86 @@ export interface ReviewCancelPayload {
   type: "cancel";
 }
 
+export interface ReviewReadyPayload {
+  type: "ready";
+}
+
+export interface ReviewClientErrorPayload {
+  type: "client-error";
+  message: string;
+  requestId?: string;
+  repositoryId?: string;
+  contextKey?: string;
+}
+
+export interface ReviewRequestComparePayload {
+  type: "request-compare";
+  requestId: string;
+  repositoryId: string;
+  baseRef: string;
+  headRef: string;
+}
+
 export interface ReviewRequestFilePayload {
   type: "request-file";
   requestId: string;
+  repositoryId: string;
+  contextKey: string;
   fileId: string;
-  scope: ReviewScope;
-  commitSha?: string;
 }
 
-export type ReviewWindowMessage = ReviewSubmitPayload | ReviewCancelPayload | ReviewRequestFilePayload;
+export type ReviewWindowMessage =
+  | ReviewReadyPayload
+  | ReviewSubmitPayload
+  | ReviewCancelPayload
+  | ReviewClientErrorPayload
+  | ReviewRequestComparePayload
+  | ReviewRequestFilePayload;
+
+export interface ReviewWorkspaceDataMessage {
+  type: "workspace-data";
+  workspaceRoot: string;
+  warnings: string[];
+  repositories: ReviewRepositoryData[];
+}
+
+export interface ReviewCompareDataMessage {
+  type: "compare-data";
+  requestId: string;
+  repositoryId: string;
+  comparison: ReviewComparisonData;
+}
+
+export interface ReviewCompareErrorMessage {
+  type: "compare-error";
+  requestId: string;
+  repositoryId: string;
+  baseRef: string;
+  headRef: string;
+  message: string;
+}
 
 export interface ReviewFileDataMessage {
   type: "file-data";
   requestId: string;
+  repositoryId: string;
+  contextKey: string;
   fileId: string;
-  scope: ReviewScope;
-  commitSha?: string;
-  originalContent: string;
-  modifiedContent: string;
+  contents: ReviewFileContents;
 }
 
 export interface ReviewFileErrorMessage {
   type: "file-error";
   requestId: string;
+  repositoryId: string;
+  contextKey: string;
   fileId: string;
-  scope: ReviewScope;
-  commitSha?: string;
   message: string;
 }
 
-export type ReviewHostMessage = ReviewFileDataMessage | ReviewFileErrorMessage;
-
-export interface ReviewWindowData {
-  repoRoot: string;
-  files: ReviewFile[];
-  commits: ReviewCommit[];
-}
+export type ReviewHostMessage =
+  | ReviewWorkspaceDataMessage
+  | ReviewCompareDataMessage
+  | ReviewCompareErrorMessage
+  | ReviewFileDataMessage
+  | ReviewFileErrorMessage;

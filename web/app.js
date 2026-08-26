@@ -1,42 +1,63 @@
-const reviewData = JSON.parse(document.getElementById("diff-review-data").textContent || "{}");
+const {
+  acceptComparison,
+  beginComparison,
+  buildFileTree,
+  contextIndexKey,
+  createCompareState,
+  directoryKey,
+  getFilePath,
+  receiveComparison,
+  rejectComparison,
+  repositoryCollapseKey,
+  restoreComparisonInputs,
+  settleFileLoad,
+  viewKey,
+} = globalThis.__piDiffReviewState;
+
+const bootstrapData = JSON.parse(document.getElementById("diff-review-data").textContent || "{}");
 
 const state = {
-  activeFileId: null,
-  currentScope: reviewData.files.some((file) => file.inGitDiff)
-    ? "git-diff"
-    : reviewData.files.some((file) => file.inLastCommit)
-      ? "last-commit"
-      : reviewData.commits?.length > 0
-        ? "commit"
-        : "all-files",
-  comments: [],
-  overallComment: "",
-  hideUnchanged: false,
-  wrapLines: true,
-  collapsedDirs: {},
-  reviewedFiles: {},
-  scrollPositions: {},
-  sidebarCollapsed: false,
+  workspaceRoot: bootstrapData.workspaceRoot || "",
+  workspaceLoaded: false,
+  warnings: [],
+  repositories: [],
+  repositoriesById: new Map(),
+  compareByRepositoryId: new Map(),
+  fileIndexesByContext: new Map(),
+  selectedMode: "uncommitted",
+  repositoryFilter: "all",
   fileFilter: "",
-  selectedCommitSha: reviewData.commits?.[0]?.sha || null,
-  fileContents: {},
-  fileErrors: {},
-  pendingRequestIds: {},
+  active: null,
+  sidebarCollapsed: false,
+  collapsedRepositories: new Set(),
+  collapsedDirectories: new Set(),
+  comments: new Map(),
+  commentCounts: new Map(),
+  reviewed: new Map(),
+  loads: new Map(),
+  viewStates: new Map(),
+  overallComment: "",
+  wrapLines: true,
+  minimap: true,
+  hideUnchanged: false,
+  requestSequence: 0,
+  initialCompareRequested: false,
+  terminalMessageSent: false,
+  clientErrorSent: false,
+  treeRowsByViewKey: new Map(),
 };
 
-const sidebarEl = document.getElementById("sidebar");
-const sidebarTitleEl = document.getElementById("sidebar-title");
-const sidebarSearchInputEl = document.getElementById("sidebar-search-input");
-const toggleSidebarButton = document.getElementById("toggle-sidebar-button");
-const scopeDiffButton = document.getElementById("scope-diff-button");
-const scopeLastCommitButton = document.getElementById("scope-last-commit-button");
-const scopeCommitButton = document.getElementById("scope-commit-button");
-const scopeAllButton = document.getElementById("scope-all-button");
-const commitSelectEl = document.getElementById("commit-select");
-const windowTitleEl = document.getElementById("window-title");
-const repoRootEl = document.getElementById("repo-root");
-const fileTreeEl = document.getElementById("file-tree");
+const rootLayoutEl = document.getElementById("root-layout");
+const workspaceRootEl = document.getElementById("workspace-root");
+const workspaceWarningsEl = document.getElementById("workspace-warnings");
 const summaryEl = document.getElementById("summary");
+const sidebarEl = document.getElementById("sidebar");
+const toggleSidebarButton = document.getElementById("toggle-sidebar-button");
+const tabUncommittedButton = document.getElementById("tab-uncommitted-button");
+const tabCompareButton = document.getElementById("tab-compare-button");
+const repositoryFilterEl = document.getElementById("repository-filter");
+const sidebarSearchInputEl = document.getElementById("sidebar-search-input");
+const fileTreeEl = document.getElementById("file-tree");
 const currentFileLabelEl = document.getElementById("current-file-label");
 const modeHintEl = document.getElementById("mode-hint");
 const fileCommentsContainer = document.getElementById("file-comments-container");
@@ -48,158 +69,211 @@ const fileCommentButton = document.getElementById("file-comment-button");
 const toggleReviewedButton = document.getElementById("toggle-reviewed-button");
 const toggleUnchangedButton = document.getElementById("toggle-unchanged-button");
 const toggleWrapButton = document.getElementById("toggle-wrap-button");
-
-repoRootEl.textContent = reviewData.repoRoot || "";
-windowTitleEl.textContent = "Review";
+const toggleMinimapButton = document.getElementById("toggle-minimap-button");
+const reviewDialogEl = document.getElementById("review-dialog");
+const reviewDialogFormEl = document.getElementById("review-dialog-form");
+const reviewDialogTitleEl = document.getElementById("review-dialog-title");
+const reviewDialogDescriptionEl = document.getElementById("review-dialog-description");
+const reviewDialogTextLabelEl = document.getElementById("review-dialog-text-label");
+const reviewDialogTextEl = document.getElementById("review-dialog-text");
+const reviewDialogCancelEl = document.getElementById("review-dialog-cancel");
+const reviewDialogSaveEl = document.getElementById("review-dialog-save");
+const fatalOverlayEl = document.getElementById("fatal-overlay");
+const fatalMessageEl = document.getElementById("fatal-message");
+const fatalCancelButton = document.getElementById("fatal-cancel-button");
 
 let monacoApi = null;
 let diffEditor = null;
 let originalModel = null;
 let modifiedModel = null;
-let originalDecorations = [];
-let modifiedDecorations = [];
-let activeViewZones = [];
-let editorResizeObserver = null;
-let requestSequence = 0;
+let originalLanguage = "plaintext";
+let modifiedLanguage = "plaintext";
+let mountedViewKey = null;
+let pendingViewRestore = null;
+let originalDecorations = null;
+let modifiedDecorations = null;
+let originalHoverDecorations = null;
+let modifiedHoverDecorations = null;
+let activeInlineZones = new Map();
+let activeFileCommentElements = new Map();
+let dialogState = null;
+let scheduledTreeRender = null;
+const dialogQueue = [];
+const hoverResetters = [];
 
-function escapeHtml(value) {
-  return String(value)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/\"/g, "&quot;");
+workspaceRootEl.textContent = state.workspaceRoot;
+
+function makeElement(tagName, className, text) {
+  const element = document.createElement(tagName);
+  if (className) element.className = className;
+  if (text != null) element.textContent = text;
+  return element;
 }
 
-function inferLanguage(path) {
-  if (!path) return "plaintext";
-  const lower = path.toLowerCase();
-  if (lower.endsWith(".ts") || lower.endsWith(".tsx")) return "typescript";
-  if (lower.endsWith(".js") || lower.endsWith(".jsx") || lower.endsWith(".mjs") || lower.endsWith(".cjs")) return "javascript";
-  if (lower.endsWith(".json")) return "json";
-  if (lower.endsWith(".md")) return "markdown";
-  if (lower.endsWith(".css")) return "css";
-  if (lower.endsWith(".html")) return "html";
-  if (lower.endsWith(".sh")) return "shell";
-  if (lower.endsWith(".yml") || lower.endsWith(".yaml")) return "yaml";
-  if (lower.endsWith(".rs")) return "rust";
-  if (lower.endsWith(".java")) return "java";
-  if (lower.endsWith(".kt")) return "kotlin";
-  if (lower.endsWith(".py")) return "python";
-  if (lower.endsWith(".go")) return "go";
-  return "plaintext";
+function nextRequestId(prefix) {
+  state.requestSequence += 1;
+  return `${prefix}:${Date.now()}:${state.requestSequence}`;
 }
 
-function scopeLabel(scope) {
-  switch (scope) {
-    case "git-diff": return "Git diff";
-    case "last-commit": return "Last commit";
-    case "commit": return "Commit history";
-    default: return "All files";
+function sendToHost(message) {
+  if (!window.glimpse?.send) {
+    showFatalError("The native review bridge is unavailable.");
+    return false;
+  }
+  try {
+    window.glimpse.send(message);
+    return true;
+  } catch (error) {
+    showFatalError(error instanceof Error ? error.message : String(error));
+    return false;
   }
 }
 
-function scopeHint(scope) {
-  switch (scope) {
-    case "git-diff":
-      return "Review working tree changes against HEAD. Hover or click line numbers in the gutter to add an inline comment.";
-    case "last-commit":
-      return "Review the last commit against its parent. Hover or click line numbers in the gutter to add an inline comment.";
-    case "commit":
-      return "Review the selected past commit against its parent. Use the commit dropdown in the sidebar to move through history.";
-    default:
-      return "Review the current working tree snapshot. Hover or click line numbers in the gutter to add a code review comment.";
+function showFatalError(message) {
+  const text = message || "Unknown browser error.";
+  fatalMessageEl.textContent = text;
+  fatalOverlayEl.hidden = false;
+  rootLayoutEl.inert = true;
+  if (!state.clientErrorSent && window.glimpse?.send) {
+    state.clientErrorSent = true;
+    try {
+      window.glimpse.send({ type: "client-error", message: text });
+    } catch {}
   }
+  fatalCancelButton.focus();
+}
+
+function sendTerminalMessage(message) {
+  if (state.terminalMessageSent) return;
+  if (sendToHost(message)) state.terminalMessageSent = true;
+}
+
+function indexChangeSet(changeSet) {
+  if (!changeSet?.context?.key) return;
+  const files = changeSet.files || [];
+  state.fileIndexesByContext.set(
+    contextIndexKey(changeSet.context.repositoryId, changeSet.context.key),
+    new Map(files.map((file) => [file.id, file])),
+  );
+  files.forEach((file) => {
+    const key = viewKey(changeSet.context.repositoryId, changeSet.context.key, file.id);
+    if (state.loads.has(key)) return;
+    state.loads.set(key, {
+      status: "idle",
+      requestId: null,
+      repositoryId: changeSet.context.repositoryId,
+      contextKey: changeSet.context.key,
+      fileId: file.id,
+      mode: changeSet.context.mode,
+    });
+  });
+}
+
+function getRepository(repositoryId) {
+  return state.repositoriesById.get(repositoryId) || null;
+}
+
+function getCompareState(repositoryId) {
+  return state.compareByRepositoryId.get(repositoryId) || null;
+}
+
+function getChangeSet(repository, mode = state.selectedMode) {
+  if (!repository) return null;
+  if (mode === "uncommitted") return repository.uncommitted || null;
+  return getCompareState(repository.id)?.comparison?.changeSet || null;
+}
+
+function getCurrentChangeSet(repositoryId) {
+  return getChangeSet(getRepository(repositoryId));
+}
+
+function getIndexedFile(repositoryId, contextKey, fileId) {
+  return state.fileIndexesByContext.get(contextIndexKey(repositoryId, contextKey))?.get(fileId) || null;
+}
+
+function getActiveDetails() {
+  if (!state.active) return null;
+  const repository = getRepository(state.active.repositoryId);
+  const changeSet = getCurrentChangeSet(state.active.repositoryId);
+  if (!repository || !changeSet || changeSet.context.key !== state.active.contextKey) return null;
+  const file = getIndexedFile(state.active.repositoryId, state.active.contextKey, state.active.fileId);
+  if (!file) return null;
+  return {
+    repository,
+    changeSet,
+    context: changeSet.context,
+    file,
+    key: viewKey(repository.id, changeSet.context.key, file.id),
+  };
+}
+
+function getBaseName(path) {
+  const parts = String(path || "").split("/");
+  return parts[parts.length - 1] || path || "(unknown)";
 }
 
 function statusLabel(status) {
-  if (!status) return "";
-  return status.charAt(0).toUpperCase() + status.slice(1);
+  switch (status) {
+    case "added": return "Added";
+    case "copied": return "Copied";
+    case "conflicted": return "Conflicted";
+    case "deleted": return "Deleted";
+    case "renamed": return "Renamed";
+    case "modified": return "Modified";
+    case "type-changed": return "Type changed";
+    default: return status || "Changed";
+  }
 }
 
-function statusBadgeClass(status) {
+function statusLetter(status) {
+  switch (status) {
+    case "added": return "A";
+    case "copied": return "C";
+    case "conflicted": return "U";
+    case "deleted": return "D";
+    case "renamed": return "R";
+    case "type-changed": return "T";
+    default: return "M";
+  }
+}
+
+function statusClass(status) {
   switch (status) {
     case "added": return "text-[#3fb950]";
+    case "conflicted": return "text-[#f85149]";
     case "deleted": return "text-[#f85149]";
+    case "copied": return "text-[#d29922]";
     case "renamed": return "text-[#d29922]";
+    case "type-changed": return "text-[#d29922]";
     default: return "text-[#58a6ff]";
   }
 }
 
-function isFileReviewed(fileId) {
-  return state.reviewedFiles[fileId] === true;
+function inferLanguage(path) {
+  const lower = String(path || "").toLowerCase();
+  if (lower.endsWith(".ts") || lower.endsWith(".tsx")) return "typescript";
+  if (lower.endsWith(".js") || lower.endsWith(".jsx") || lower.endsWith(".mjs") || lower.endsWith(".cjs")) return "javascript";
+  if (lower.endsWith(".json") || lower.endsWith(".jsonc")) return "json";
+  if (lower.endsWith(".md") || lower.endsWith(".mdx")) return "markdown";
+  if (lower.endsWith(".css")) return "css";
+  if (lower.endsWith(".scss") || lower.endsWith(".sass")) return "scss";
+  if (lower.endsWith(".html") || lower.endsWith(".htm")) return "html";
+  if (lower.endsWith(".sh") || lower.endsWith(".bash") || lower.endsWith(".zsh")) return "shell";
+  if (lower.endsWith(".yml") || lower.endsWith(".yaml")) return "yaml";
+  if (lower.endsWith(".rs")) return "rust";
+  if (lower.endsWith(".java")) return "java";
+  if (lower.endsWith(".kt") || lower.endsWith(".kts")) return "kotlin";
+  if (lower.endsWith(".py")) return "python";
+  if (lower.endsWith(".go")) return "go";
+  if (lower.endsWith(".c") || lower.endsWith(".h")) return "c";
+  if (lower.endsWith(".cc") || lower.endsWith(".cpp") || lower.endsWith(".hpp")) return "cpp";
+  if (lower.endsWith(".xml")) return "xml";
+  if (lower.endsWith(".sql")) return "sql";
+  return "plaintext";
 }
 
-function getScopedFiles() {
-  switch (state.currentScope) {
-    case "git-diff":
-      return reviewData.files.filter((file) => file.inGitDiff);
-    case "last-commit":
-      return reviewData.files.filter((file) => file.inLastCommit);
-    case "commit":
-      return reviewData.files.filter((file) => state.selectedCommitSha && file.commitComparisons?.[state.selectedCommitSha]);
-    default:
-      return reviewData.files.filter((file) => file.hasWorkingTreeFile);
-  }
-}
-
-function ensureActiveFileForScope() {
-  const scopedFiles = getScopedFiles();
-  if (scopedFiles.length === 0) {
-    state.activeFileId = null;
-    return;
-  }
-  if (scopedFiles.some((file) => file.id === state.activeFileId)) {
-    return;
-  }
-  state.activeFileId = scopedFiles[0].id;
-}
-
-function activeFile() {
-  return reviewData.files.find((file) => file.id === state.activeFileId) ?? null;
-}
-
-function getScopeComparison(file, scope = state.currentScope) {
-  if (!file) return null;
-  if (scope === "git-diff") return file.gitDiff;
-  if (scope === "last-commit") return file.lastCommit;
-  if (scope === "commit") return state.selectedCommitSha ? file.commitComparisons?.[state.selectedCommitSha] ?? null : null;
-  return null;
-}
-
-function activeComparison() {
-  return getScopeComparison(activeFile(), state.currentScope);
-}
-
-function activeFileShowsDiff() {
-  return activeComparison() != null;
-}
-
-function getScopeFilePath(file) {
-  const comparison = getScopeComparison(file, state.currentScope);
-  return comparison?.newPath || comparison?.oldPath || file?.path || "";
-}
-
-function getScopeDisplayPath(file, scope = state.currentScope) {
-  const comparison = getScopeComparison(file, scope);
-  return comparison?.displayPath || file?.path || "";
-}
-
-function getFileSearchPath(file) {
-  return file?.path || "";
-}
-
-function getBaseName(path) {
-  const parts = path.split("/");
-  return parts[parts.length - 1] || path;
-}
-
-function getActiveStatus(file) {
-  const comparison = getScopeComparison(file, state.currentScope);
-  return comparison?.status ?? file?.worktreeStatus ?? null;
-}
-
-function normalizeQuery(query) {
-  return String(query || "").trim().toLowerCase().replace(/\s+/g, "");
+function normalizeQuery(value) {
+  return String(value || "").trim().toLowerCase().replace(/\s+/g, "");
 }
 
 function scoreSubsequence(query, candidate) {
@@ -208,342 +282,763 @@ function scoreSubsequence(query, candidate) {
   let score = 0;
   let firstMatchIndex = -1;
   let previousMatchIndex = -2;
-
-  for (let i = 0; i < candidate.length && queryIndex < query.length; i += 1) {
-    if (candidate[i] !== query[queryIndex]) continue;
-
-    if (firstMatchIndex === -1) firstMatchIndex = i;
+  for (let index = 0; index < candidate.length && queryIndex < query.length; index += 1) {
+    if (candidate[index] !== query[queryIndex]) continue;
+    if (firstMatchIndex === -1) firstMatchIndex = index;
     score += 10;
-
-    if (i === previousMatchIndex + 1) {
-      score += 8;
-    }
-
-    const previousChar = i > 0 ? candidate[i - 1] : "";
-    if (i === 0 || previousChar === "/" || previousChar === "_" || previousChar === "-" || previousChar === ".") {
-      score += 12;
-    }
-
-    previousMatchIndex = i;
+    if (index === previousMatchIndex + 1) score += 8;
+    const previous = index > 0 ? candidate[index - 1] : "";
+    if (index === 0 || "/_-.".includes(previous)) score += 12;
+    previousMatchIndex = index;
     queryIndex += 1;
   }
-
   if (queryIndex !== query.length) return -1;
-  if (firstMatchIndex >= 0) score += Math.max(0, 20 - firstMatchIndex);
-  return score;
+  return score + Math.max(0, 20 - firstMatchIndex);
 }
 
 function getFileSearchScore(query, file) {
-  const normalizedQuery = normalizeQuery(query);
-  if (!normalizedQuery) return 0;
-
-  const path = getFileSearchPath(file).toLowerCase();
-  const baseName = getBaseName(path);
-  const pathScore = scoreSubsequence(normalizedQuery, path);
-  const baseScore = scoreSubsequence(normalizedQuery, baseName);
+  const normalized = normalizeQuery(query);
+  if (!normalized) return 0;
+  const path = [file.displayPath, file.newPath, file.oldPath].filter(Boolean).join(" ").toLowerCase();
+  const baseName = getBaseName(file.newPath || file.oldPath || file.displayPath).toLowerCase();
+  const pathScore = scoreSubsequence(normalized, path);
+  const baseScore = scoreSubsequence(normalized, baseName);
   let score = Math.max(pathScore, baseScore >= 0 ? baseScore + 40 : -1);
-
   if (score < 0) return -1;
-  if (baseName === normalizedQuery) score += 200;
-  else if (baseName.startsWith(normalizedQuery)) score += 120;
-  else if (path.includes(normalizedQuery)) score += 35;
-
+  if (baseName === normalized) score += 200;
+  else if (baseName.startsWith(normalized)) score += 120;
+  else if (path.includes(normalized)) score += 35;
   return score;
 }
 
-function getFilteredFiles() {
-  const scopedFiles = getScopedFiles();
+function filteredFiles(changeSet) {
+  const files = [...(changeSet?.files || [])];
   const query = state.fileFilter.trim();
-  if (!query) return [...scopedFiles];
-
-  return scopedFiles
+  if (!query) return files.sort((a, b) => getFilePath(a).localeCompare(getFilePath(b)));
+  return files
     .map((file) => ({ file, score: getFileSearchScore(query, file) }))
     .filter((entry) => entry.score >= 0)
-    .sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score;
-      return getFileSearchPath(a.file).localeCompare(getFileSearchPath(b.file));
-    })
+    .sort((a, b) => b.score - a.score || getFilePath(a.file).localeCompare(getFilePath(b.file)))
     .map((entry) => entry.file);
 }
 
-function buildTree(files) {
-  const root = { name: "", path: "", kind: "dir", children: new Map(), file: null };
-  for (const file of files) {
-    const path = getFileSearchPath(file);
-    const parts = path.split("/");
-    let node = root;
-    let currentPath = "";
-    for (let i = 0; i < parts.length; i += 1) {
-      const part = parts[i];
-      const isLeaf = i === parts.length - 1;
-      currentPath = currentPath ? `${currentPath}/${part}` : part;
-      if (!node.children.has(part)) {
-        node.children.set(part, {
-          name: part,
-          path: currentPath,
-          kind: isLeaf ? "file" : "dir",
-          children: new Map(),
-          file: isLeaf ? file : null,
-        });
-      }
-      node = node.children.get(part);
-      if (isLeaf) node.file = file;
-    }
-  }
-  return root;
+function currentViewKey() {
+  return getActiveDetails()?.key || null;
 }
 
-function scopeInstanceKey(scope) {
-  return scope === "commit" ? `${scope}:${state.selectedCommitSha || ""}` : scope;
+function isReviewed(key) {
+  return state.reviewed.has(key);
 }
 
-function cacheKey(scope, fileId) {
-  return `${scopeInstanceKey(scope)}:${fileId}`;
+function getLoad(key) {
+  return state.loads.get(key) || null;
 }
 
-function scrollKey(scope, fileId) {
-  return `${scopeInstanceKey(scope)}:${fileId}`;
+function activeComments(side) {
+  const key = currentViewKey();
+  if (!key) return [];
+  return [...state.comments.values()].filter((comment) => viewKey(comment.repositoryId, comment.contextKey, comment.fileId) === key && (!side || comment.side === side));
 }
 
-function saveCurrentScrollPosition() {
-  if (!diffEditor || !state.activeFileId) return;
-  const originalEditor = diffEditor.getOriginalEditor();
-  const modifiedEditor = diffEditor.getModifiedEditor();
-  state.scrollPositions[scrollKey(state.currentScope, state.activeFileId)] = {
-    originalTop: originalEditor.getScrollTop(),
-    originalLeft: originalEditor.getScrollLeft(),
-    modifiedTop: modifiedEditor.getScrollTop(),
-    modifiedLeft: modifiedEditor.getScrollLeft(),
-  };
+function updateSummary() {
+  const repositoryCount = state.repositories.length;
+  const commentCount = state.comments.size;
+  const note = state.overallComment ? " • overall note" : "";
+  summaryEl.textContent = state.workspaceLoaded
+    ? `${repositoryCount} repositor${repositoryCount === 1 ? "y" : "ies"} • ${commentCount} comment${commentCount === 1 ? "" : "s"}${note}`
+    : "Loading workspace…";
 }
 
-function restoreFileScrollPosition() {
-  if (!diffEditor || !state.activeFileId) return;
-  const scrollState = state.scrollPositions[scrollKey(state.currentScope, state.activeFileId)];
-  if (!scrollState) return;
-  const originalEditor = diffEditor.getOriginalEditor();
-  const modifiedEditor = diffEditor.getModifiedEditor();
-  originalEditor.setScrollTop(scrollState.originalTop);
-  originalEditor.setScrollLeft(scrollState.originalLeft);
-  modifiedEditor.setScrollTop(scrollState.modifiedTop);
-  modifiedEditor.setScrollLeft(scrollState.modifiedLeft);
+function updateWarnings() {
+  const warnings = state.warnings.map((warning) => typeof warning === "string" ? warning : warning?.message || String(warning));
+  workspaceWarningsEl.textContent = warnings.join(" • ");
+  workspaceWarningsEl.className = warnings.length
+    ? "border-b border-[#d29922]/30 bg-[#d29922]/10 px-4 py-2 text-xs text-[#e3b341]"
+    : "hidden";
 }
 
-function captureScrollState() {
-  if (!diffEditor) return null;
-  const originalEditor = diffEditor.getOriginalEditor();
-  const modifiedEditor = diffEditor.getModifiedEditor();
-  return {
-    originalTop: originalEditor.getScrollTop(),
-    originalLeft: originalEditor.getScrollLeft(),
-    modifiedTop: modifiedEditor.getScrollTop(),
-    modifiedLeft: modifiedEditor.getScrollLeft(),
-  };
+function activeButtonClass(active) {
+  return active
+    ? "cursor-pointer rounded-md border border-[#2ea043]/40 bg-[#238636]/15 px-3 py-1.5 text-xs font-medium text-[#3fb950] hover:bg-[#238636]/25"
+    : "cursor-pointer rounded-md border border-review-border bg-review-panel px-3 py-1.5 text-xs font-medium text-review-text hover:bg-[#21262d]";
 }
 
-function restoreScrollState(scrollState) {
-  if (!diffEditor || !scrollState) return;
-  const originalEditor = diffEditor.getOriginalEditor();
-  const modifiedEditor = diffEditor.getModifiedEditor();
-  originalEditor.setScrollTop(scrollState.originalTop);
-  originalEditor.setScrollLeft(scrollState.originalLeft);
-  modifiedEditor.setScrollTop(scrollState.modifiedTop);
-  modifiedEditor.setScrollLeft(scrollState.modifiedLeft);
+function updateTabs() {
+  const uncommitted = state.selectedMode === "uncommitted";
+  tabUncommittedButton.className = activeButtonClass(uncommitted);
+  tabCompareButton.className = activeButtonClass(!uncommitted);
+  tabUncommittedButton.setAttribute("aria-selected", String(uncommitted));
+  tabCompareButton.setAttribute("aria-selected", String(!uncommitted));
 }
 
-function getRequestState(fileId, scope = state.currentScope) {
-  const key = cacheKey(scope, fileId);
-  return {
-    contents: state.fileContents[key],
-    error: state.fileErrors[key],
-    requestId: state.pendingRequestIds[key],
-  };
-}
-
-function ensureFileLoaded(fileId, scope = state.currentScope) {
-  if (!fileId) return;
-  const key = cacheKey(scope, fileId);
-  if (state.fileContents[key] != null) return;
-  if (state.fileErrors[key] != null) return;
-  if (state.pendingRequestIds[key] != null) return;
-
-  const requestId = `request:${Date.now()}:${++requestSequence}`;
-  state.pendingRequestIds[key] = requestId;
-  renderTree();
-  if (window.glimpse?.send) {
-    window.glimpse.send({ type: "request-file", requestId, fileId, scope, commitSha: scope === "commit" ? state.selectedCommitSha : undefined });
-  }
-}
-
-function openFile(fileId) {
-  if (state.activeFileId === fileId) {
-    ensureFileLoaded(fileId, state.currentScope);
-    return;
-  }
-  saveCurrentScrollPosition();
-  state.activeFileId = fileId;
-  renderAll({ restoreFileScroll: true });
-  ensureFileLoaded(fileId, state.currentScope);
-}
-
-function renderTreeNode(node, depth) {
-  const children = [...node.children.values()].sort((a, b) => {
-    if (a.kind !== b.kind) return a.kind === "dir" ? -1 : 1;
-    return a.name.localeCompare(b.name);
-  });
-
-  const indentPx = 12;
-
-  for (const child of children) {
-    if (child.kind === "dir") {
-      const collapsed = state.collapsedDirs[child.path] === true;
-      const row = document.createElement("button");
-      row.type = "button";
-      row.className = "group flex w-full items-center gap-1.5 px-2 py-1 text-left text-[13px] text-[#c9d1d9] hover:bg-[#21262d]";
-      row.style.paddingLeft = `${depth * indentPx + 8}px`;
-      row.innerHTML = `
-        <svg class="h-4 w-4 shrink-0 text-[#8b949e] transition-transform ${collapsed ? "-rotate-90" : ""}" viewBox="0 0 16 16" fill="currentColor">
-          <path d="M12.78 6.22a.749.749 0 0 1 0 1.06l-4.25 4.25a.749.749 0 0 1-1.06 0L3.22 7.28a.749.749 0 0 1 1.06-1.06L8 9.939l3.72-3.719a.749.749 0 0 1 1.06 0Z"></path>
-        </svg>
-        <span class="truncate">${escapeHtml(child.name)}</span>
-      `;
-      row.addEventListener("click", () => {
-        state.collapsedDirs[child.path] = !collapsed;
-        renderTree();
-      });
-      fileTreeEl.appendChild(row);
-      if (!collapsed) renderTreeNode(child, depth + 1);
-      continue;
-    }
-
-    const file = child.file;
-    const count = state.comments.filter((comment) => comment.fileId === file.id && comment.scope === state.currentScope && (comment.scope !== "commit" || comment.commitSha === state.selectedCommitSha)).length;
-    const reviewed = isFileReviewed(file.id);
-    const requestState = getRequestState(file.id, state.currentScope);
-    const loading = requestState.requestId != null && requestState.contents == null;
-    const errored = requestState.error != null;
-    const status = getActiveStatus(file);
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = [
-      "group flex w-full items-center justify-between gap-2 px-2 py-1 text-left text-[13px]",
-      file.id === state.activeFileId ? "bg-[#373e47] text-white" : reviewed ? "text-[#c9d1d9] hover:bg-[#21262d]" : "text-[#8b949e] hover:bg-[#21262d] hover:text-[#c9d1d9]",
-    ].join(" ");
-    button.style.paddingLeft = `${(depth * indentPx) + 26}px`;
-    button.innerHTML = `
-      <span class="flex min-w-0 items-center gap-1.5 truncate ${file.id === state.activeFileId ? "font-medium" : ""}">
-        <span class="shrink-0 text-[10px] ${reviewed ? "text-[#3fb950]" : errored ? "text-red-400" : loading ? "text-[#58a6ff]" : "text-transparent"}">${reviewed ? "●" : errored ? "!" : loading ? "…" : "●"}</span>
-        <span class="truncate">${escapeHtml(child.name)}</span>
-      </span>
-      <span class="flex shrink-0 items-center gap-1.5">
-        ${count > 0 ? `<span class="flex h-4 min-w-[16px] items-center justify-center rounded-full bg-[#1f2937] px-1 text-[10px] font-medium text-[#c9d1d9]">${count}</span>` : ""}
-        ${status ? `<span class="font-medium ${statusBadgeClass(status)}">${escapeHtml(statusLabel(status).charAt(0))}</span>` : ""}
-      </span>
-    `;
-    button.addEventListener("click", () => openFile(file.id));
-    fileTreeEl.appendChild(button);
-  }
-}
-
-function renderSearchResults(files) {
-  files.forEach((file) => {
-    const path = getFileSearchPath(file);
-    const baseName = getBaseName(path);
-    const parentPath = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
-    const count = state.comments.filter((comment) => comment.fileId === file.id && comment.scope === state.currentScope && (comment.scope !== "commit" || comment.commitSha === state.selectedCommitSha)).length;
-    const reviewed = isFileReviewed(file.id);
-    const requestState = getRequestState(file.id, state.currentScope);
-    const loading = requestState.requestId != null && requestState.contents == null;
-    const errored = requestState.error != null;
-    const status = getActiveStatus(file);
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = [
-      "group flex w-full items-center justify-between gap-3 rounded-md px-2 py-2 text-left",
-      file.id === state.activeFileId ? "bg-[#373e47] text-white" : "text-[#c9d1d9] hover:bg-[#21262d]",
-    ].join(" ");
-    button.innerHTML = `
-      <span class="min-w-0 flex-1">
-        <span class="flex items-center gap-1.5">
-          <span class="shrink-0 text-[10px] ${reviewed ? "text-[#3fb950]" : errored ? "text-red-400" : loading ? "text-[#58a6ff]" : "text-transparent"}">${reviewed ? "●" : errored ? "!" : loading ? "…" : "●"}</span>
-          <span class="truncate text-[13px] ${file.id === state.activeFileId ? "font-medium" : ""}">${escapeHtml(baseName)}</span>
-        </span>
-        <span class="mt-0.5 block truncate pl-[14px] text-[11px] ${file.id === state.activeFileId ? "text-[#c9d1d9]" : "text-review-muted"}">${escapeHtml(parentPath || path)}</span>
-      </span>
-      <span class="flex shrink-0 items-center gap-1.5">
-        ${count > 0 ? `<span class="flex h-4 min-w-[16px] items-center justify-center rounded-full bg-[#1f2937] px-1 text-[10px] font-medium text-[#c9d1d9]">${count}</span>` : ""}
-        ${status ? `<span class="font-medium ${statusBadgeClass(status)}">${escapeHtml(statusLabel(status).charAt(0))}</span>` : ""}
-      </span>
-    `;
-    button.addEventListener("click", () => openFile(file.id));
-    fileTreeEl.appendChild(button);
-  });
-}
-
-function updateSidebarLayout() {
-  const collapsed = state.sidebarCollapsed;
-  sidebarEl.style.width = collapsed ? "0px" : "280px";
-  sidebarEl.style.minWidth = collapsed ? "0px" : "280px";
-  sidebarEl.style.flexBasis = collapsed ? "0px" : "280px";
-  sidebarEl.style.borderRightWidth = collapsed ? "0px" : "1px";
-  sidebarEl.style.pointerEvents = collapsed ? "none" : "auto";
-  toggleSidebarButton.textContent = collapsed ? "Show sidebar" : "Hide sidebar";
-}
-
-function updateScopeButtons() {
-  const counts = {
-    diff: reviewData.files.filter((file) => file.inGitDiff).length,
-    lastCommit: reviewData.files.filter((file) => file.inLastCommit).length,
-    commit: state.selectedCommitSha ? reviewData.files.filter((file) => file.commitComparisons?.[state.selectedCommitSha]).length : 0,
-    all: reviewData.files.filter((file) => file.hasWorkingTreeFile).length,
-  };
-
-  const applyButtonClasses = (button, active, disabled) => {
-    button.disabled = disabled;
-    button.className = disabled
-      ? "cursor-default rounded-md border border-review-border bg-[#11161d] px-2.5 py-1 text-[11px] font-medium text-review-muted opacity-60"
-      : active
-        ? "cursor-pointer rounded-md border border-[#2ea043]/40 bg-[#238636]/15 px-2.5 py-1 text-[11px] font-medium text-[#3fb950] hover:bg-[#238636]/25"
-        : "cursor-pointer rounded-md border border-review-border bg-review-panel px-2.5 py-1 text-[11px] font-medium text-review-text hover:bg-[#21262d]";
-  };
-
-  scopeDiffButton.textContent = `Git diff${counts.diff > 0 ? ` (${counts.diff})` : ""}`;
-  scopeLastCommitButton.textContent = `Last commit${counts.lastCommit > 0 ? ` (${counts.lastCommit})` : ""}`;
-  scopeCommitButton.textContent = `Commits${counts.commit > 0 ? ` (${counts.commit})` : ""}`;
-  scopeAllButton.textContent = `All files${counts.all > 0 ? ` (${counts.all})` : ""}`;
-
-  applyButtonClasses(scopeDiffButton, state.currentScope === "git-diff", counts.diff === 0);
-  applyButtonClasses(scopeLastCommitButton, state.currentScope === "last-commit", counts.lastCommit === 0);
-  applyButtonClasses(scopeCommitButton, state.currentScope === "commit", !state.selectedCommitSha || counts.commit === 0);
-  applyButtonClasses(scopeAllButton, state.currentScope === "all-files", counts.all === 0);
-
-  commitSelectEl.className = state.currentScope === "commit"
-    ? "mb-3 block w-full rounded-md border border-review-border bg-review-panel px-2 py-2 text-xs text-review-text outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-    : "mb-3 hidden w-full rounded-md border border-review-border bg-review-panel px-2 py-2 text-xs text-review-text outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500";
-}
-
-function updateToggleButtons() {
-  const file = activeFile();
-  const reviewed = file ? isFileReviewed(file.id) : false;
+function updateToolbar() {
+  const active = getActiveDetails();
+  const reviewed = active ? isReviewed(active.key) : false;
+  const fileReady = active ? getLoad(active.key)?.status === "ready" : false;
+  toggleReviewedButton.disabled = !active;
   toggleReviewedButton.textContent = reviewed ? "Reviewed" : "Mark reviewed";
+  toggleReviewedButton.setAttribute("aria-pressed", String(reviewed));
   toggleReviewedButton.className = reviewed
     ? "cursor-pointer rounded-md border border-[#2ea043]/40 bg-[#238636]/15 px-3 py-1 text-xs font-medium text-[#3fb950] hover:bg-[#238636]/25"
-    : "cursor-pointer rounded-md border border-review-border bg-review-panel px-3 py-1 text-xs font-medium text-review-text hover:bg-[#21262d]";
+    : "rounded-md border border-review-border bg-review-panel px-3 py-1 text-xs font-medium text-review-text disabled:cursor-default disabled:opacity-50";
+  if (active) toggleReviewedButton.classList.add("cursor-pointer", "hover:bg-[#21262d]");
   toggleWrapButton.textContent = `Wrap lines: ${state.wrapLines ? "on" : "off"}`;
+  toggleWrapButton.setAttribute("aria-pressed", String(state.wrapLines));
+  toggleMinimapButton.textContent = `Minimap: ${state.minimap ? "on" : "off"}`;
+  toggleMinimapButton.setAttribute("aria-pressed", String(state.minimap));
+  toggleUnchangedButton.disabled = !active;
   toggleUnchangedButton.textContent = state.hideUnchanged ? "Show full file" : "Show changed areas only";
-  toggleUnchangedButton.style.display = activeFileShowsDiff() ? "inline-flex" : "none";
-  updateScopeButtons();
-  modeHintEl.textContent = scopeHint(state.currentScope);
-  submitButton.disabled = false;
+  toggleUnchangedButton.setAttribute("aria-pressed", String(state.hideUnchanged));
+  if (active) toggleUnchangedButton.classList.add("cursor-pointer", "hover:bg-[#21262d]");
+  fileCommentButton.disabled = !fileReady;
+  fileCommentButton.classList.toggle("cursor-pointer", fileReady);
+  fileCommentButton.classList.toggle("hover:bg-[#21262d]", fileReady);
+}
+
+function updateCurrentFileHeader() {
+  const active = getActiveDetails();
+  if (!state.workspaceLoaded) {
+    currentFileLabelEl.textContent = "Loading workspace…";
+    modeHintEl.textContent = "Waiting for repository data.";
+    return;
+  }
+  if (!active) {
+    currentFileLabelEl.textContent = "No file selected";
+    modeHintEl.textContent = state.selectedMode === "compare"
+      ? "Choose refs for a repository, then select a changed file."
+      : "No uncommitted file is available in the selected repositories.";
+    return;
+  }
+  currentFileLabelEl.textContent = `${active.repository.name} • ${active.file.displayPath}`;
+  if (active.context.mode === "compare") {
+    const base = active.context.baseRef || active.context.baseOid || "base";
+    const head = active.context.headRef || active.context.headOid || "head";
+    modeHintEl.textContent = `Compare ${base} → ${head}. Select lines or use the gutter to add a comment.`;
+  } else {
+    modeHintEl.textContent = "Uncommitted changes. Select lines or use the gutter to add a comment.";
+  }
+}
+
+function captureTreeFocus() {
+  const activeElement = document.activeElement;
+  if (!activeElement || !fileTreeEl.contains(activeElement) || !activeElement.dataset.focusKey) return null;
+  return {
+    key: activeElement.dataset.focusKey,
+    start: typeof activeElement.selectionStart === "number" ? activeElement.selectionStart : null,
+    end: typeof activeElement.selectionEnd === "number" ? activeElement.selectionEnd : null,
+  };
+}
+
+function findTreeFocusTarget(focusKey) {
+  if (!focusKey) return null;
+  return [...fileTreeEl.querySelectorAll("[data-focus-key]")]
+    .find((element) => element.dataset.focusKey === focusKey) || null;
+}
+
+function restoreTreeFocus(snapshot) {
+  if (!snapshot) return;
+  const target = findTreeFocusTarget(snapshot.key);
+  if (!target) return;
+  target.focus({ preventScroll: true });
+  if (snapshot.start != null && typeof target.setSelectionRange === "function") {
+    target.setSelectionRange(snapshot.start, snapshot.end ?? snapshot.start);
+  }
+}
+
+function appendMessage(parent, text, className = "px-3 py-2 text-xs text-review-muted") {
+  parent.appendChild(makeElement("div", className, text));
+}
+
+function registerTreeRow(key, row) {
+  const rows = state.treeRowsByViewKey.get(key) || [];
+  rows.push(row);
+  state.treeRowsByViewKey.set(key, rows);
+}
+
+function fileRowAriaLabel(file, key) {
+  const count = state.commentCounts.get(key) || 0;
+  const parts = [file.displayPath, statusLabel(file.status)];
+  if (isReviewed(key)) parts.push("reviewed");
+  if (count) parts.push(`${count} comment${count === 1 ? "" : "s"}`);
+  const load = getLoad(key);
+  if (load?.status === "loading") parts.push("loading");
+  if (load?.status === "error") parts.push("load failed");
+  return parts.join(", ");
+}
+
+function applyFileRowState(row, file, key) {
+  const active = currentViewKey() === key;
+  const reviewed = isReviewed(key);
+  const count = state.commentCounts.get(key) || 0;
+  const load = getLoad(key);
+  row.button.className = [
+    "group flex w-full items-center justify-between gap-2 py-1 pr-2 text-left text-[13px]",
+    active ? "bg-[#373e47] text-white" : reviewed ? "text-[#c9d1d9] hover:bg-[#21262d]" : "text-[#8b949e] hover:bg-[#21262d] hover:text-[#c9d1d9]",
+  ].join(" ");
+  row.button.setAttribute("aria-current", active ? "true" : "false");
+  row.button.setAttribute("aria-label", fileRowAriaLabel(file, key));
+  row.marker.textContent = reviewed ? "●" : load?.status === "error" ? "!" : load?.status === "loading" ? "…" : "";
+  row.marker.className = `shrink-0 text-[10px] ${reviewed ? "text-[#3fb950]" : load?.status === "error" ? "text-red-400" : load?.status === "loading" ? "text-[#58a6ff]" : "text-transparent"}`;
+  row.count.textContent = count ? String(count) : "";
+  row.count.hidden = count === 0;
+}
+
+function updateFileRow(key) {
+  const active = getActiveDetails();
+  const rows = state.treeRowsByViewKey.get(key) || [];
+  const first = rows[0];
+  const file = first?.file || (active?.key === key ? active.file : null);
+  if (!file) return;
+  rows.forEach((row) => applyFileRowState(row, file, key));
+}
+
+function createFileRow(repository, changeSet, file, depth, parent) {
+  const key = viewKey(repository.id, changeSet.context.key, file.id);
+  const button = makeElement("button", "", null);
+  button.type = "button";
+  button.style.paddingLeft = `${depth * 12 + 20}px`;
+  button.dataset.focusKey = `file:${key}`;
+  const left = makeElement("span", "flex min-w-0 items-center gap-1.5 truncate");
+  const marker = makeElement("span", "shrink-0 text-[10px]");
+  const name = makeElement("span", "truncate", state.fileFilter.trim() ? file.displayPath : getBaseName(getFilePath(file)));
+  name.title = file.displayPath;
+  left.append(marker, name);
+  const right = makeElement("span", "flex shrink-0 items-center gap-1.5");
+  const count = makeElement("span", "flex h-4 min-w-[16px] items-center justify-center rounded-full bg-[#1f2937] px-1 text-[10px] font-medium text-[#c9d1d9]");
+  const status = makeElement("span", `font-medium ${statusClass(file.status)}`, statusLetter(file.status));
+  status.title = statusLabel(file.status);
+  right.append(count, status);
+  button.append(left, right);
+  button.addEventListener("click", () => activateFile(repository.id, changeSet.context, file.id));
+  const row = { button, marker, count, file };
+  applyFileRowState(row, file, key);
+  registerTreeRow(key, row);
+  parent.appendChild(button);
+}
+
+function sortedTreeChildren(node) {
+  return [...node.children.values()].sort((a, b) => {
+    const aDirectory = a.children.size > 0;
+    const bDirectory = b.children.size > 0;
+    if (aDirectory !== bDirectory) return aDirectory ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+}
+
+function compactDirectory(node) {
+  const names = [node.name];
+  let terminal = node;
+  while (!terminal.file && terminal.children.size === 1) {
+    const child = [...terminal.children.values()][0];
+    if (child.file || child.children.size === 0) break;
+    names.push(child.name);
+    terminal = child;
+  }
+  return { label: names.join("/"), terminal };
+}
+
+function renderTreeNode(repository, changeSet, node, depth, parent) {
+  if (node.file) createFileRow(repository, changeSet, node.file, depth, parent);
+  if (node.children.size === 0) return;
+  const compact = compactDirectory(node);
+  const collapseKey = directoryKey(state.selectedMode, repository.id, changeSet.context.key, compact.terminal.path);
+  const collapsed = state.collapsedDirectories.has(collapseKey);
+  const directoryButton = makeElement("button", "group flex w-full items-center gap-1.5 py-1 pr-2 text-left text-[13px] text-[#c9d1d9] hover:bg-[#21262d]");
+  directoryButton.type = "button";
+  directoryButton.style.paddingLeft = `${depth * 12 + 8}px`;
+  directoryButton.dataset.focusKey = `dir:${collapseKey}`;
+  directoryButton.setAttribute("aria-expanded", String(!collapsed));
+  const arrow = makeElement("span", `w-4 shrink-0 text-center text-[#8b949e] ${collapsed ? "-rotate-90" : ""}`, "▾");
+  const label = makeElement("span", "truncate", `${compact.label}/`);
+  directoryButton.append(arrow, label);
+  directoryButton.addEventListener("click", () => {
+    if (collapsed) state.collapsedDirectories.delete(collapseKey);
+    else state.collapsedDirectories.add(collapseKey);
+    renderTree();
+  });
+  parent.appendChild(directoryButton);
+  if (collapsed) return;
+  sortedTreeChildren(compact.terminal).forEach((child) => renderTreeNode(repository, changeSet, child, depth + 1, parent));
+}
+
+function renderFileCollection(repository, changeSet, files, parent) {
+  if (state.fileFilter.trim()) {
+    files.forEach((file) => createFileRow(repository, changeSet, file, 1, parent));
+    return;
+  }
+  const tree = buildFileTree(files);
+  sortedTreeChildren(tree).forEach((node) => renderTreeNode(repository, changeSet, node, 0, parent));
+}
+
+function repoStatusText(repository, changeSet, compareState) {
+  if (repository.error) return "Repository error";
+  if (state.selectedMode === "compare" && compareState?.loading) return "Loading comparison…";
+  if (state.selectedMode === "compare" && !changeSet) return compareState?.error ? "Comparison failed" : "Not compared";
+  const count = changeSet?.files?.length || 0;
+  return `${count} changed file${count === 1 ? "" : "s"}`;
+}
+
+function createCompareForm(repository, compareState) {
+  const form = makeElement("form", "mx-2 mb-2 grid grid-cols-[1fr_1fr_auto] gap-1.5 rounded-md border border-review-border bg-[#11161d] p-2");
+  const baseInput = makeElement("input", "min-w-0 rounded border border-review-border bg-[#010409] px-2 py-1.5 text-[11px] text-review-text outline-none focus:border-blue-500");
+  baseInput.type = "text";
+  baseInput.value = compareState.baseInput;
+  baseInput.placeholder = "Base ref";
+  baseInput.setAttribute("aria-label", `Base ref for ${repository.name}`);
+  baseInput.dataset.focusKey = `compare-base:${repository.id}`;
+  baseInput.addEventListener("input", () => { compareState.baseInput = baseInput.value; });
+  const headInput = makeElement("input", "min-w-0 rounded border border-review-border bg-[#010409] px-2 py-1.5 text-[11px] text-review-text outline-none focus:border-blue-500");
+  headInput.type = "text";
+  headInput.value = compareState.headInput;
+  headInput.placeholder = "Head ref";
+  headInput.setAttribute("aria-label", `Head ref for ${repository.name}`);
+  headInput.dataset.focusKey = `compare-head:${repository.id}`;
+  headInput.addEventListener("input", () => { compareState.headInput = headInput.value; });
+  const applyButton = makeElement("button", "rounded border border-review-border bg-review-panel px-2 py-1.5 text-[11px] font-medium text-review-text hover:bg-[#21262d]", "Apply");
+  applyButton.type = "submit";
+  applyButton.dataset.focusKey = `compare-apply:${repository.id}`;
+  form.append(baseInput, headInput, applyButton);
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    requestComparison(repository.id, compareState.baseInput, compareState.headInput);
+  });
+  return form;
+}
+
+function renderRepository(repository, fragment) {
+  const compareState = getCompareState(repository.id);
+  const changeSet = getChangeSet(repository);
+  const files = filteredFiles(changeSet);
+  const collapseKey = repositoryCollapseKey(state.selectedMode, repository.id);
+  const forceExpanded = state.fileFilter.trim().length > 0;
+  const collapsed = !forceExpanded && state.collapsedRepositories.has(collapseKey);
+  const section = makeElement("section", "mt-2 overflow-hidden rounded-md border border-review-border bg-[#0d1117]");
+  const header = makeElement("button", "flex w-full items-center gap-2 bg-[#161b22] px-2 py-2 text-left hover:bg-[#21262d]");
+  header.type = "button";
+  header.dataset.focusKey = `repo:${collapseKey}`;
+  header.setAttribute("aria-expanded", String(!collapsed));
+  const arrow = makeElement("span", `w-4 shrink-0 text-center text-review-muted ${collapsed ? "-rotate-90" : ""}`, "▾");
+  const labels = makeElement("span", "min-w-0 flex-1");
+  labels.append(
+    makeElement("span", "block truncate text-[13px] font-semibold text-review-text", repository.name),
+    makeElement("span", "block truncate text-[10px] text-review-muted", repository.workspacePath || repository.name),
+  );
+  const status = makeElement("span", "shrink-0 text-[10px] text-review-muted", repoStatusText(repository, changeSet, compareState));
+  header.append(arrow, labels, status);
+  header.addEventListener("click", () => {
+    if (collapsed) state.collapsedRepositories.delete(collapseKey);
+    else state.collapsedRepositories.add(collapseKey);
+    renderTree();
+  });
+  section.appendChild(header);
+  if (!collapsed) {
+    if (state.selectedMode === "compare") section.appendChild(createCompareForm(repository, compareState));
+    if (repository.error) appendMessage(section, repository.error, "mx-2 mb-2 rounded border border-red-500/20 bg-red-500/10 px-2 py-2 text-xs text-red-400");
+    if (state.selectedMode === "compare" && compareState?.error) {
+      appendMessage(section, compareState.error, "mx-2 mb-2 rounded border border-red-500/20 bg-red-500/10 px-2 py-2 text-xs text-red-400");
+    }
+    if (changeSet && files.length > 0) renderFileCollection(repository, changeSet, files, section);
+    else if (changeSet && state.fileFilter.trim()) appendMessage(section, "No files match the filter.");
+    else if (changeSet) appendMessage(section, "No changed files.");
+    else if (state.selectedMode === "uncommitted") appendMessage(section, "No uncommitted changes.");
+    else if (compareState?.loading) appendMessage(section, "Resolving refs and computing changes…");
+    else appendMessage(section, repository.baseRef ? "Apply refs to compare." : "Enter a base ref to compare.");
+  }
+  fragment.appendChild(section);
+}
+
+function renderTree() {
+  if (scheduledTreeRender !== null) {
+    cancelAnimationFrame(scheduledTreeRender);
+    scheduledTreeRender = null;
+  }
+  const scrollTop = fileTreeEl.scrollTop;
+  const focusSnapshot = captureTreeFocus();
+  state.treeRowsByViewKey = new Map();
+  const fragment = document.createDocumentFragment();
+  if (!state.workspaceLoaded) {
+    appendMessage(fragment, "Loading workspace…", "px-3 py-4 text-sm text-review-muted");
+  } else {
+    const repositories = state.repositories.filter((repository) => state.repositoryFilter === "all" || repository.id === state.repositoryFilter);
+    if (repositories.length === 0) appendMessage(fragment, "No repository matches the filter.", "px-3 py-4 text-sm text-review-muted");
+    repositories.forEach((repository) => renderRepository(repository, fragment));
+  }
+  fileTreeEl.replaceChildren(fragment);
+  fileTreeEl.scrollTop = scrollTop;
+  restoreTreeFocus(focusSnapshot);
+  updateTabs();
+  updateToolbar();
+  updateSummary();
+}
+
+function scheduleTreeRender() {
+  if (scheduledTreeRender !== null) return;
+  scheduledTreeRender = requestAnimationFrame(() => {
+    scheduledTreeRender = null;
+    const previousKey = currentViewKey();
+    ensureActiveSelection();
+    renderTree();
+    if (currentViewKey() !== previousKey) mountActiveFile({ restoreSaved: true });
+  });
+}
+
+function clearFileFilter() {
+  const previousKey = currentViewKey();
+  state.fileFilter = "";
+  sidebarSearchInputEl.value = "";
+  ensureActiveSelection();
+  renderTree();
+  if (currentViewKey() !== previousKey) mountActiveFile({ restoreSaved: true });
+}
+
+function populateRepositoryFilter() {
+  const previous = state.repositoryFilter;
+  repositoryFilterEl.replaceChildren();
+  const all = makeElement("option", "", "All repositories");
+  all.value = "all";
+  repositoryFilterEl.appendChild(all);
+  state.repositories.forEach((repository) => {
+    const detail = repository.workspacePath && repository.workspacePath !== repository.name ? ` — ${repository.workspacePath}` : "";
+    const option = makeElement("option", "", `${repository.name}${detail}`);
+    option.value = repository.id;
+    option.title = repository.workspacePath;
+    repositoryFilterEl.appendChild(option);
+  });
+  state.repositoryFilter = previous === "all" || state.repositoriesById.has(previous) ? previous : "all";
+  repositoryFilterEl.value = state.repositoryFilter;
+}
+
+function saveActiveViewState() {
+  const active = getActiveDetails();
+  if (!active || !diffEditor?.saveViewState) return;
+  const saved = diffEditor.saveViewState();
+  if (!saved) return;
+  state.viewStates.set(active.key, {
+    repositoryId: active.repository.id,
+    contextKey: active.context.key,
+    fileId: active.file.id,
+    mode: active.context.mode,
+    viewState: saved,
+  });
+}
+
+function firstFileForMode() {
+  const repositories = state.repositories.filter((repository) => state.repositoryFilter === "all" || repository.id === state.repositoryFilter);
+  for (const repository of repositories) {
+    const changeSet = getChangeSet(repository);
+    const file = filteredFiles(changeSet)[0];
+    if (file) return { repository, changeSet, file };
+  }
+  return null;
+}
+
+function ensureActiveSelection() {
+  if (getActiveDetails()) return;
+  const first = firstFileForMode();
+  state.active = first ? {
+    repositoryId: first.repository.id,
+    contextKey: first.changeSet.context.key,
+    fileId: first.file.id,
+  } : null;
+}
+
+function activateFile(repositoryId, context, fileId) {
+  const key = viewKey(repositoryId, context.key, fileId);
+  const previousKey = currentViewKey();
+  const same = previousKey === key;
+  const load = getLoad(key);
+  if (same) {
+    if (load?.status === "error") {
+      requestFile(key, true);
+      mountActiveFile({ preserveCurrent: true });
+    }
+    updateFileRow(key);
+    return;
+  }
+  if (!same) {
+    saveActiveViewState();
+    state.active = { repositoryId, contextKey: context.key, fileId };
+  }
+  requestFile(key, load?.status === "error");
+  mountActiveFile({ restoreSaved: true });
+  if (previousKey) updateFileRow(previousKey);
+  updateFileRow(key);
+}
+
+function requestFile(key, force = false) {
+  const active = getActiveDetails();
+  if (!active || active.key !== key) return;
+  const existing = getLoad(key);
+  if (!force && existing && existing.status !== "idle") return;
+  const requestId = nextRequestId("file");
+  state.loads.set(key, {
+    status: "loading",
+    requestId,
+    repositoryId: active.repository.id,
+    contextKey: active.context.key,
+    fileId: active.file.id,
+    mode: active.context.mode,
+  });
+  updateFileRow(key);
+  sendToHost({
+    type: "request-file",
+    requestId,
+    repositoryId: active.repository.id,
+    contextKey: active.context.key,
+    fileId: active.file.id,
+  });
+}
+
+function selectMode(mode) {
+  if (state.selectedMode === mode) {
+    if (mode === "compare" && requestInitialComparisons()) renderTree();
+    return;
+  }
+  saveActiveViewState();
+  state.selectedMode = mode;
+  state.active = null;
+  if (mode === "compare") requestInitialComparisons();
+  ensureActiveSelection();
+  renderTree();
+  mountActiveFile({ restoreSaved: true });
+}
+
+function requestInitialComparisons() {
+  if (!state.workspaceLoaded || state.initialCompareRequested) return false;
+  state.initialCompareRequested = true;
+  let requested = false;
+  state.repositories.forEach((repository) => {
+    if (!repository.baseRef?.trim()) return;
+    requested = true;
+    requestComparison(repository.id, repository.baseRef, repository.headRef, false);
+  });
+  return requested;
+}
+
+function requestComparison(repositoryId, baseRefValue, headRefValue, renderImmediately = true) {
+  const compareState = getCompareState(repositoryId);
+  if (!compareState) return;
+  const baseRef = String(baseRefValue || "").trim();
+  const headRef = String(headRefValue || "").trim();
+  compareState.baseInput = baseRef;
+  compareState.headInput = headRef;
+  if (!baseRef || !headRef) {
+    compareState.error = "Both base and head refs are required.";
+    if (renderImmediately) renderTree();
+    return;
+  }
+  if (baseRef.startsWith("-") || headRef.startsWith("-") || /[\0\r\n]/.test(baseRef) || /[\0\r\n]/.test(headRef)) {
+    compareState.error = "Refs cannot start with a dash or contain line breaks.";
+    if (renderImmediately) renderTree();
+    return;
+  }
+  const requestId = nextRequestId("compare");
+  state.compareByRepositoryId.set(repositoryId, beginComparison(compareState, requestId, baseRef, headRef));
+  if (renderImmediately) renderTree();
+  sendToHost({ type: "request-compare", requestId, repositoryId, baseRef, headRef });
+}
+
+function hasCompareReviewState(repositoryId) {
+  for (const comment of state.comments.values()) {
+    if (comment.repositoryId === repositoryId && comment.mode === "compare") return true;
+  }
+  for (const reviewed of state.reviewed.values()) {
+    if (reviewed.repositoryId === repositoryId && reviewed.mode === "compare") return true;
+  }
+  return false;
+}
+
+function clearCompareReviewState(repositoryId) {
+  for (const [commentId, comment] of state.comments) {
+    if (comment.repositoryId !== repositoryId || comment.mode !== "compare") continue;
+    const key = viewKey(comment.repositoryId, comment.contextKey, comment.fileId);
+    state.comments.delete(commentId);
+    const count = Math.max(0, (state.commentCounts.get(key) || 1) - 1);
+    if (count) state.commentCounts.set(key, count);
+    else state.commentCounts.delete(key);
+  }
+  for (const [key, reviewed] of state.reviewed) {
+    if (reviewed.repositoryId === repositoryId && reviewed.mode === "compare") state.reviewed.delete(key);
+  }
+  for (const [key, load] of state.loads) {
+    if (load.repositoryId === repositoryId && load.mode === "compare") state.loads.delete(key);
+  }
+  for (const [key, saved] of state.viewStates) {
+    if (saved.repositoryId === repositoryId && saved.mode === "compare") state.viewStates.delete(key);
+  }
+}
+
+function applyComparison(repositoryId, comparison) {
+  const compareState = getCompareState(repositoryId);
+  const nextCompareState = acceptComparison(compareState, comparison);
+  if (!nextCompareState) return;
+  const previousActiveKey = currentViewKey();
+  const oldContextKey = compareState.comparison?.changeSet?.context?.key || null;
+  const newContextKey = comparison.changeSet.context.key;
+  if (oldContextKey && oldContextKey !== newContextKey) clearCompareReviewState(repositoryId);
+  state.compareByRepositoryId.set(repositoryId, nextCompareState);
+  indexChangeSet(comparison.changeSet);
+  if (state.active?.repositoryId === repositoryId && state.active.contextKey !== newContextKey && state.selectedMode === "compare") {
+    state.active = null;
+  }
+  ensureActiveSelection();
+  renderTree();
+  if (currentViewKey() !== previousActiveKey) mountActiveFile({ restoreSaved: true });
+  else {
+    updateCurrentFileHeader();
+    updateToolbar();
+  }
+}
+
+function handleCompareData(message) {
+  const compareState = receiveComparison(getCompareState(message.repositoryId), message);
+  if (!compareState || !message.comparison?.changeSet?.context?.key) return;
+  state.compareByRepositoryId.set(message.repositoryId, compareState);
+  const previous = compareState.comparison;
+  const previousContextKey = previous?.changeSet?.context?.key || null;
+  const nextContextKey = message.comparison.changeSet.context.key;
+  const pendingReviewTarget = dialogState?.reviewTarget;
+  if (
+    previousContextKey &&
+    previousContextKey !== nextContextKey &&
+    pendingReviewTarget?.repositoryId === message.repositoryId &&
+    pendingReviewTarget.contextKey === previousContextKey
+  ) {
+    dialogState.afterClose = () => handleCompareData(message);
+    return;
+  }
+  if (previousContextKey && previousContextKey !== nextContextKey && hasCompareReviewState(message.repositoryId)) {
+    openConfirmDialog({
+      title: "Replace this comparison?",
+      description: "The resolved refs changed. Applying them will clear this repository’s compare comments and reviewed state.",
+      saveLabel: "Clear and apply",
+      onConfirm: () => {
+        if (getCompareState(message.repositoryId)?.latestRequestId === message.requestId) applyComparison(message.repositoryId, message.comparison);
+      },
+      onCancel: () => {
+        const current = getCompareState(message.repositoryId);
+        if (!current || current.latestRequestId !== message.requestId) return;
+        state.compareByRepositoryId.set(message.repositoryId, restoreComparisonInputs(current, previous));
+        renderTree();
+      },
+    });
+    renderTree();
+    return;
+  }
+  applyComparison(message.repositoryId, message.comparison);
+}
+
+function handleCompareError(message) {
+  const compareState = rejectComparison(getCompareState(message.repositoryId), message);
+  if (!compareState) return;
+  state.compareByRepositoryId.set(message.repositoryId, compareState);
+  renderTree();
+}
+
+function handleWorkspaceData(message) {
+  saveActiveViewState();
+  state.workspaceRoot = message.workspaceRoot || state.workspaceRoot;
+  state.warnings = Array.isArray(message.warnings) ? message.warnings : [];
+  state.repositories = Array.isArray(message.repositories) ? message.repositories : [];
+  state.repositoriesById = new Map(state.repositories.map((repository) => [repository.id, repository]));
+  state.compareByRepositoryId = new Map(state.repositories.map((repository) => [repository.id, createCompareState(repository)]));
+  state.fileIndexesByContext = new Map();
+  state.repositories.forEach((repository) => indexChangeSet(repository.uncommitted));
+  state.workspaceLoaded = true;
+  workspaceRootEl.textContent = state.workspaceRoot;
+  populateRepositoryFilter();
+  updateWarnings();
+  state.active = null;
+  ensureActiveSelection();
+  if (state.selectedMode === "compare") requestInitialComparisons();
+  renderTree();
+  mountActiveFile({ restoreSaved: true });
+}
+
+function contentText(content) {
+  if (!content || content.kind === "missing") return "";
+  if (content.kind === "text" || content.kind === "symlink" || content.kind === "gitlink") return content.text || "";
+  if (content.kind === "binary") {
+    return content.byteLength == null ? "[Binary content is unavailable]" : `[Binary content is unavailable • ${content.byteLength} bytes]`;
+  }
+  if (content.kind === "special") return `[Content is unavailable: ${content.message || "special file"}]`;
+  return "[Content is unavailable]";
+}
+
+function contentSupportsLineComments(content) {
+  return content?.kind === "text" || content?.kind === "symlink" || content?.kind === "gitlink";
+}
+
+function activeLoadedContents() {
+  const key = currentViewKey();
+  const load = key ? getLoad(key) : null;
+  return load?.status === "ready" ? load.contents : null;
+}
+
+function canCommentOnSide(side) {
+  const contents = activeLoadedContents();
+  return !!contents && contentSupportsLineComments(contents[side]);
+}
+
+function mountedContents(active) {
+  const load = active ? getLoad(active.key) : null;
+  if (!active) return { original: "", modified: "" };
+  if (load?.status === "ready") {
+    return { original: contentText(load.contents.original), modified: contentText(load.contents.modified) };
+  }
+  if (load?.status === "error") {
+    const text = `Failed to load ${active.file.displayPath}\n\n${load.message}`;
+    return { original: text, modified: text };
+  }
+  const text = `Loading ${active.file.displayPath}…`;
+  return { original: text, modified: text };
+}
+
+function captureEditorAnchor(editor) {
+  if (!editor) return null;
+  const firstRange = editor.getVisibleRanges()[0];
+  const lineNumber = firstRange?.startLineNumber || editor.getPosition()?.lineNumber || 1;
+  return {
+    lineNumber,
+    pixelDelta: editor.getScrollTop() - editor.getTopForLineNumber(lineNumber),
+    scrollLeft: editor.getScrollLeft(),
+  };
+}
+
+function restoreEditorAnchor(editor, anchor) {
+  if (!editor || !anchor) return;
+  const lineNumber = Math.min(anchor.lineNumber, editor.getModel()?.getLineCount() || 1);
+  editor.setScrollTop(editor.getTopForLineNumber(lineNumber) + anchor.pixelDelta);
+  editor.setScrollLeft(anchor.scrollLeft);
+}
+
+function captureBothEditorAnchors() {
+  if (!diffEditor) return null;
+  return {
+    original: captureEditorAnchor(diffEditor.getOriginalEditor()),
+    modified: captureEditorAnchor(diffEditor.getModifiedEditor()),
+  };
+}
+
+function restoreBothEditorAnchors(anchors) {
+  if (!diffEditor || !anchors) return;
+  restoreEditorAnchor(diffEditor.getOriginalEditor(), anchors.original);
+  restoreEditorAnchor(diffEditor.getModifiedEditor(), anchors.modified);
 }
 
 function applyEditorOptions() {
   if (!diffEditor) return;
   diffEditor.updateOptions({
-    renderSideBySide: activeFileShowsDiff(),
+    renderSideBySide: true,
     diffWordWrap: state.wrapLines ? "on" : "off",
+    minimap: {
+      enabled: state.minimap,
+      renderCharacters: false,
+      showSlider: "always",
+      size: "proportional",
+    },
     hideUnchangedRegions: {
-      enabled: activeFileShowsDiff() && state.hideUnchanged,
+      enabled: state.hideUnchanged,
       contextLineCount: 4,
       minimumLineCount: 2,
       revealLineCount: 12,
@@ -553,436 +1048,286 @@ function applyEditorOptions() {
   diffEditor.getModifiedEditor().updateOptions({ wordWrap: state.wrapLines ? "on" : "off" });
 }
 
-function renderTree() {
-  ensureActiveFileForScope();
-  fileTreeEl.innerHTML = "";
-  const scopedFiles = getScopedFiles();
-  const visibleFiles = getFilteredFiles();
-
-  if (visibleFiles.length === 0) {
-    const message = state.fileFilter.trim()
-      ? `No files match <span class="text-review-text">${escapeHtml(state.fileFilter.trim())}</span>.`
-      : `No files in <span class="text-review-text">${escapeHtml(scopeLabel(state.currentScope).toLowerCase())}</span>.`;
-    fileTreeEl.innerHTML = `
-      <div class="px-3 py-4 text-sm text-review-muted">
-        ${message}
-      </div>
-    `;
-  } else if (state.fileFilter.trim()) {
-    renderSearchResults(visibleFiles);
-  } else {
-    renderTreeNode(buildTree(visibleFiles), 0);
+function clearActiveCommentSurfaces() {
+  if (diffEditor && activeInlineZones.size) {
+    const byEditor = new Map();
+    for (const zone of activeInlineZones.values()) {
+      const ids = byEditor.get(zone.editor) || [];
+      ids.push(zone.zoneId);
+      byEditor.set(zone.editor, ids);
+    }
+    for (const [editor, zoneIds] of byEditor) {
+      editor.changeViewZones((accessor) => zoneIds.forEach((zoneId) => accessor.removeZone(zoneId)));
+    }
   }
-
-  sidebarTitleEl.textContent = scopeLabel(state.currentScope);
-  const comments = state.comments.length;
-  const filteredSuffix = state.fileFilter.trim() ? ` • ${visibleFiles.length} shown` : "";
-  summaryEl.textContent = `${scopedFiles.length} file(s) • ${comments} comment(s)${state.overallComment ? " • overall note" : ""}${filteredSuffix}`;
-  updateToggleButtons();
-  updateSidebarLayout();
+  activeInlineZones = new Map();
+  activeFileCommentElements = new Map();
+  fileCommentsContainer.replaceChildren();
+  fileCommentsContainer.className = "hidden";
+  originalDecorations?.set([]);
+  modifiedDecorations?.set([]);
+  hoverResetters.forEach((reset) => reset());
 }
 
-function showTextModal(options) {
-  const backdrop = document.createElement("div");
-  backdrop.className = "review-modal-backdrop";
-  backdrop.innerHTML = `
-    <div class="review-modal-card">
-      <div class="mb-2 text-base font-semibold text-white">${escapeHtml(options.title)}</div>
-      <div class="mb-4 text-sm text-review-muted">${escapeHtml(options.description)}</div>
-      <textarea id="review-modal-text" class="scrollbar-thin min-h-48 w-full resize-y rounded-md border border-review-border bg-[#010409] px-3 py-2 text-sm text-review-text outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500">${escapeHtml(options.initialValue ?? "")}</textarea>
-      <div class="mt-4 flex justify-end gap-2">
-        <button id="review-modal-cancel" class="cursor-pointer rounded-md border border-review-border bg-review-panel px-4 py-2 text-sm font-medium text-review-text hover:bg-[#21262d]">Cancel</button>
-        <button id="review-modal-save" class="cursor-pointer rounded-md border border-[rgba(240,246,252,0.1)] bg-[#238636] px-4 py-2 text-sm font-medium text-white hover:bg-[#2ea043]">${escapeHtml(options.saveLabel ?? "Save")}</button>
-      </div>
-    </div>
-  `;
-  document.body.appendChild(backdrop);
-  const textarea = backdrop.querySelector("#review-modal-text");
-  const close = () => backdrop.remove();
-  backdrop.querySelector("#review-modal-cancel").addEventListener("click", close);
-  backdrop.querySelector("#review-modal-save").addEventListener("click", () => {
-    options.onSave(textarea.value.trim());
-    close();
-  });
-  backdrop.addEventListener("click", (event) => {
-    if (event.target === backdrop) close();
-  });
-  textarea.focus();
+function commentTitle(comment) {
+  if (comment.side === "file") return "File comment";
+  const side = comment.side === "original" ? "Original" : "Modified";
+  return comment.startLine === comment.endLine
+    ? `${side} line ${comment.startLine}`
+    : `${side} lines ${comment.startLine}–${comment.endLine}`;
 }
 
-function showOverallCommentModal() {
-  showTextModal({
-    title: "Overall review note",
-    description: "This note is prepended to the generated prompt above the inline comments.",
-    initialValue: state.overallComment,
-    saveLabel: "Save note",
-    onSave: (value) => {
-      state.overallComment = value;
-      renderTree();
-    },
-  });
-}
-
-function showFileCommentModal() {
-  const file = activeFile();
-  if (!file) return;
-  showTextModal({
-    title: `File comment for ${getScopeDisplayPath(file, state.currentScope)}`,
-    description: `This comment applies to the whole file in ${scopeLabel(state.currentScope).toLowerCase()}.`,
-    initialValue: "",
-    saveLabel: "Add comment",
-    onSave: (value) => {
-      if (!value) return;
-      state.comments.push({
-        id: `${Date.now()}:${Math.random().toString(16).slice(2)}`,
-        fileId: file.id,
-        scope: state.currentScope,
-        commitSha: state.currentScope === "commit" ? state.selectedCommitSha : undefined,
-        side: "file",
-        startLine: null,
-        endLine: null,
-        body: value,
-      });
-      submitButton.disabled = false;
-      updateCommentsUI();
-    },
-  });
-}
-
-function layoutEditor() {
-  if (!diffEditor) return;
-  const width = editorContainerEl.clientWidth;
-  const height = editorContainerEl.clientHeight;
-  if (width <= 0 || height <= 0) return;
-  diffEditor.layout({ width, height });
-}
-
-function clearViewZones() {
-  if (!diffEditor || activeViewZones.length === 0) return;
-  const original = diffEditor.getOriginalEditor();
-  const modified = diffEditor.getModifiedEditor();
-  original.changeViewZones((accessor) => {
-    for (const zone of activeViewZones) if (zone.editor === original) accessor.removeZone(zone.id);
-  });
-  modified.changeViewZones((accessor) => {
-    for (const zone of activeViewZones) if (zone.editor === modified) accessor.removeZone(zone.id);
-  });
-  activeViewZones = [];
-}
-
-function renderCommentDOM(comment, onDelete) {
-  const container = document.createElement("div");
-  container.className = "view-zone-container";
-  const title = comment.side === "file"
-    ? `File comment • ${scopeLabel(comment.scope)}`
-    : `${comment.side === "original" ? "Original" : "Modified"} line ${comment.startLine} • ${scopeLabel(comment.scope)}`;
-
-  container.innerHTML = `
-    <div class="mb-2 flex items-center justify-between gap-3">
-      <div class="text-xs font-semibold text-review-text">${escapeHtml(title)}</div>
-      <button data-action="delete" class="cursor-pointer rounded-md border border-transparent bg-transparent px-2 py-1 text-xs font-medium text-review-muted hover:bg-red-500/10 hover:text-red-400">Delete</button>
-    </div>
-    <textarea data-comment-id="${escapeHtml(comment.id)}" class="scrollbar-thin min-h-[76px] w-full resize-y rounded-md border border-review-border bg-[#010409] px-3 py-2 text-sm text-review-text outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500" placeholder="Leave a comment"></textarea>
-  `;
-  const textarea = container.querySelector("textarea");
+function createCommentEditor(comment, inline) {
+  const container = makeElement("div", inline ? "view-zone-container" : "rounded-lg border border-review-border bg-review-panel p-4");
+  container.dataset.commentEditor = comment.id;
+  const header = makeElement("div", "mb-2 flex items-center justify-between gap-3");
+  const title = makeElement("div", "text-xs font-semibold text-review-text", commentTitle(comment));
+  const deleteButton = makeElement("button", "cursor-pointer rounded-md border border-transparent bg-transparent px-2 py-1 text-xs font-medium text-review-muted hover:bg-red-500/10 hover:text-red-400", "Delete");
+  deleteButton.type = "button";
+  deleteButton.setAttribute("aria-label", `Delete ${commentTitle(comment).toLowerCase()}`);
+  deleteButton.addEventListener("click", () => deleteComment(comment.id));
+  header.append(title, deleteButton);
+  const textarea = makeElement("textarea", inline
+    ? "scrollbar-thin h-[76px] w-full resize-none overflow-auto rounded-md border border-review-border bg-[#010409] px-3 py-2 text-sm text-review-text outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+    : "scrollbar-thin min-h-[76px] w-full resize-y rounded-md border border-review-border bg-[#010409] px-3 py-2 text-sm text-review-text outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500");
   textarea.value = comment.body || "";
-  textarea.addEventListener("input", () => {
-    comment.body = textarea.value;
-  });
-  container.querySelector("[data-action='delete']").addEventListener("click", onDelete);
-  if (!comment.body) setTimeout(() => textarea.focus(), 50);
-  return container;
+  textarea.placeholder = "Leave a review comment";
+  textarea.dataset.commentId = comment.id;
+  textarea.dataset.commentInput = "true";
+  textarea.setAttribute("aria-label", commentTitle(comment));
+  textarea.addEventListener("input", () => { comment.body = textarea.value; });
+  container.append(header, textarea);
+  return { container, textarea };
 }
 
-function canCommentOnSide(file, side) {
-  if (!file) return false;
-  const comparison = activeComparison();
-  if (side === "original") {
-    return comparison != null && comparison.hasOriginal;
-  }
-  return comparison != null ? comparison.hasModified : file.hasWorkingTreeFile;
-}
-
-function isActiveFileReady() {
-  const file = activeFile();
-  if (!file) return false;
-  const requestState = getRequestState(file.id, state.currentScope);
-  return requestState.contents != null && requestState.error == null;
-}
-
-function syncViewZones() {
-  clearViewZones();
-  if (!diffEditor || !isActiveFileReady()) return;
-  const file = activeFile();
-  if (!file) return;
-
-  const originalEditor = diffEditor.getOriginalEditor();
-  const modifiedEditor = diffEditor.getModifiedEditor();
-  const inlineComments = state.comments.filter((comment) => comment.fileId === file.id && comment.scope === state.currentScope && (comment.scope !== "commit" || comment.commitSha === state.selectedCommitSha) && comment.side !== "file");
-
-  inlineComments.forEach((item) => {
-    const editor = item.side === "original" ? originalEditor : modifiedEditor;
-    const domNode = renderCommentDOM(item, () => {
-      state.comments = state.comments.filter((comment) => comment.id !== item.id);
-      updateCommentsUI();
-    });
-
-    editor.changeViewZones((accessor) => {
-      const lineCount = typeof item.body === "string" && item.body.length > 0 ? item.body.split("\n").length : 1;
-      const id = accessor.addZone({
-        afterLineNumber: item.startLine,
-        heightInPx: Math.max(150, lineCount * 22 + 86),
-        domNode,
-      });
-      activeViewZones.push({ id, editor });
+function addInlineZone(comment, focus = false) {
+  if (!diffEditor || activeInlineZones.has(comment.id) || viewKey(comment.repositoryId, comment.contextKey, comment.fileId) !== currentViewKey()) return;
+  const editor = comment.side === "original" ? diffEditor.getOriginalEditor() : diffEditor.getModifiedEditor();
+  const anchor = captureEditorAnchor(editor);
+  const editorDom = createCommentEditor(comment, true);
+  let zoneId = null;
+  editor.changeViewZones((accessor) => {
+    zoneId = accessor.addZone({
+      afterLineNumber: comment.endLine,
+      heightInPx: 138,
+      domNode: editorDom.container,
     });
   });
+  restoreEditorAnchor(editor, anchor);
+  activeInlineZones.set(comment.id, { zoneId, editor, element: editorDom.container, textarea: editorDom.textarea });
+  if (focus) requestAnimationFrame(() => editorDom.textarea.focus({ preventScroll: true }));
 }
 
-function updateDecorations() {
-  if (!diffEditor || !monacoApi) return;
-  const file = activeFile();
-  const comments = file ? state.comments.filter((comment) => comment.fileId === file.id && comment.scope === state.currentScope && (comment.scope !== "commit" || comment.commitSha === state.selectedCommitSha) && comment.side !== "file") : [];
-  const originalRanges = [];
-  const modifiedRanges = [];
+function removeInlineZone(commentId) {
+  const zone = activeInlineZones.get(commentId);
+  if (!zone) return;
+  const anchor = captureEditorAnchor(zone.editor);
+  zone.editor.changeViewZones((accessor) => accessor.removeZone(zone.zoneId));
+  restoreEditorAnchor(zone.editor, anchor);
+  activeInlineZones.delete(commentId);
+}
 
-  for (const comment of comments) {
-    const range = {
-      range: new monacoApi.Range(comment.startLine, 1, comment.startLine, 1),
+function ensureFileCommentsVisibility() {
+  fileCommentsContainer.className = activeFileCommentElements.size
+    ? "scrollbar-thin max-h-[35vh] space-y-4 overflow-auto border-b border-review-border bg-[#0d1117] px-4 py-4"
+    : "hidden";
+}
+
+function addFileCommentElement(comment, focus = false) {
+  if (activeFileCommentElements.has(comment.id) || viewKey(comment.repositoryId, comment.contextKey, comment.fileId) !== currentViewKey()) return;
+  const anchors = captureBothEditorAnchors();
+  const editorDom = createCommentEditor(comment, false);
+  fileCommentsContainer.appendChild(editorDom.container);
+  activeFileCommentElements.set(comment.id, { element: editorDom.container, textarea: editorDom.textarea });
+  ensureFileCommentsVisibility();
+  requestAnimationFrame(() => {
+    restoreBothEditorAnchors(anchors);
+    if (focus) editorDom.textarea.focus({ preventScroll: true });
+  });
+}
+
+function removeFileCommentElement(commentId) {
+  const entry = activeFileCommentElements.get(commentId);
+  if (!entry) return;
+  const anchors = captureBothEditorAnchors();
+  entry.element.remove();
+  activeFileCommentElements.delete(commentId);
+  ensureFileCommentsVisibility();
+  requestAnimationFrame(() => restoreBothEditorAnchors(anchors));
+}
+
+function refreshActiveDecorations() {
+  if (!monacoApi || !originalDecorations || !modifiedDecorations) return;
+  const original = [];
+  const modified = [];
+  for (const comment of activeComments()) {
+    if (comment.side === "file") continue;
+    const decoration = {
+      range: new monacoApi.Range(comment.startLine, 1, comment.endLine, 1),
       options: {
         isWholeLine: true,
         className: comment.side === "original" ? "review-comment-line-original" : "review-comment-line-modified",
         glyphMarginClassName: comment.side === "original" ? "review-comment-glyph-original" : "review-comment-glyph-modified",
       },
     };
-    if (comment.side === "original") originalRanges.push(range);
-    else modifiedRanges.push(range);
+    if (comment.side === "original") original.push(decoration);
+    else modified.push(decoration);
   }
-
-  originalDecorations = diffEditor.getOriginalEditor().deltaDecorations(originalDecorations, originalRanges);
-  modifiedDecorations = diffEditor.getModifiedEditor().deltaDecorations(modifiedDecorations, modifiedRanges);
+  originalDecorations.set(original);
+  modifiedDecorations.set(modified);
 }
 
-function renderFileComments() {
-  fileCommentsContainer.innerHTML = "";
-  const file = activeFile();
-  if (!file) {
-    fileCommentsContainer.className = "hidden overflow-hidden px-0 py-0";
-    return;
+function mountActiveCommentSurfaces() {
+  for (const comment of activeComments()) {
+    if (comment.side === "file") addFileCommentElement(comment);
+    else addInlineZone(comment);
   }
-
-  const fileComments = state.comments.filter((comment) => comment.fileId === file.id && comment.scope === state.currentScope && (comment.scope !== "commit" || comment.commitSha === state.selectedCommitSha) && comment.side === "file");
-
-  if (fileComments.length === 0) {
-    fileCommentsContainer.className = "hidden overflow-hidden px-0 py-0";
-    return;
-  }
-
-  fileCommentsContainer.className = "border-b border-review-border bg-[#0d1117] px-4 py-4 space-y-4";
-  fileComments.forEach((comment) => {
-    const dom = renderCommentDOM(comment, () => {
-      state.comments = state.comments.filter((item) => item.id !== comment.id);
-      updateCommentsUI();
-    });
-    dom.className = "rounded-lg border border-review-border bg-review-panel p-4";
-    fileCommentsContainer.appendChild(dom);
-  });
+  refreshActiveDecorations();
 }
 
-function getPlaceholderContents(file, scope) {
-  const path = getScopeDisplayPath(file, scope);
-  const requestState = getRequestState(file.id, scope);
-  if (requestState.error) {
-    const body = `Failed to load ${path}\n\n${requestState.error}`;
-    return { originalContent: body, modifiedContent: body };
+function mountActiveFile(options = {}) {
+  updateCurrentFileHeader();
+  updateToolbar();
+  if (!diffEditor || !originalModel || !modifiedModel) return;
+  const active = getActiveDetails();
+  if (active && getLoad(active.key)?.status === "idle") requestFile(active.key);
+  const nextKey = active?.key || null;
+  const currentState = options.preserveCurrent ? diffEditor.saveViewState?.() : null;
+  const savedState = options.restoreSaved && nextKey ? state.viewStates.get(nextKey)?.viewState : null;
+  const restoreState = currentState || savedState || null;
+  const contents = mountedContents(active);
+  const loaded = activeLoadedContents();
+  const originalNextLanguage = active && loaded?.original?.kind === "text"
+    ? inferLanguage(active.file.oldPath || getFilePath(active.file))
+    : "plaintext";
+  const modifiedNextLanguage = active && loaded?.modified?.kind === "text"
+    ? inferLanguage(active.file.newPath || getFilePath(active.file))
+    : "plaintext";
+  clearActiveCommentSurfaces();
+  if (originalLanguage !== originalNextLanguage) {
+    monacoApi.editor.setModelLanguage(originalModel, originalNextLanguage);
+    originalLanguage = originalNextLanguage;
   }
-  const body = `Loading ${path}...`;
-  return { originalContent: body, modifiedContent: body };
-}
-
-function getMountedContents(file, scope = state.currentScope) {
-  return getRequestState(file.id, scope).contents || getPlaceholderContents(file, scope);
-}
-
-function mountFile(options = {}) {
-  if (!diffEditor || !monacoApi) return;
-  const file = activeFile();
-  if (!file) {
-    currentFileLabelEl.textContent = "No file selected";
-    clearViewZones();
-    if (originalModel) originalModel.dispose();
-    if (modifiedModel) modifiedModel.dispose();
-    originalModel = monacoApi.editor.createModel("", "plaintext");
-    modifiedModel = monacoApi.editor.createModel("", "plaintext");
-    diffEditor.setModel({ original: originalModel, modified: modifiedModel });
-    applyEditorOptions();
-    updateDecorations();
-    renderFileComments();
-    requestAnimationFrame(layoutEditor);
-    return;
+  if (modifiedLanguage !== modifiedNextLanguage) {
+    monacoApi.editor.setModelLanguage(modifiedModel, modifiedNextLanguage);
+    modifiedLanguage = modifiedNextLanguage;
   }
-
-  ensureFileLoaded(file.id, state.currentScope);
-
-  const preserveScroll = options.preserveScroll === true;
-  const scrollState = preserveScroll ? captureScrollState() : null;
-  const language = inferLanguage(getScopeFilePath(file) || file.path);
-  const contents = getMountedContents(file, state.currentScope);
-
-  clearViewZones();
-  currentFileLabelEl.textContent = getScopeDisplayPath(file, state.currentScope);
-
-  if (originalModel) originalModel.dispose();
-  if (modifiedModel) modifiedModel.dispose();
-
-  originalModel = monacoApi.editor.createModel(contents.originalContent, language);
-  modifiedModel = monacoApi.editor.createModel(contents.modifiedContent, language);
-
-  diffEditor.setModel({ original: originalModel, modified: modifiedModel });
+  if (originalModel.getValue() !== contents.original) originalModel.setValue(contents.original);
+  if (modifiedModel.getValue() !== contents.modified) modifiedModel.setValue(contents.modified);
+  mountedViewKey = nextKey;
   applyEditorOptions();
-  syncViewZones();
-  updateDecorations();
-  renderFileComments();
-  requestAnimationFrame(() => {
-    layoutEditor();
-    if (options.restoreFileScroll) restoreFileScrollPosition();
-    if (options.preserveScroll) restoreScrollState(scrollState);
-    setTimeout(() => {
-      layoutEditor();
-      if (options.restoreFileScroll) restoreFileScrollPosition();
-      if (options.preserveScroll) restoreScrollState(scrollState);
-    }, 50);
+  mountActiveCommentSurfaces();
+  pendingViewRestore = restoreState && nextKey ? { key: nextKey, viewState: restoreState } : null;
+  const restore = () => {
+    if (pendingViewRestore?.key === mountedViewKey) diffEditor.restoreViewState(pendingViewRestore.viewState);
+    else if (!restoreState) {
+      diffEditor.getOriginalEditor().setScrollPosition({ scrollTop: 0, scrollLeft: 0 });
+      diffEditor.getModifiedEditor().setScrollPosition({ scrollTop: 0, scrollLeft: 0 });
+    }
+  };
+  requestAnimationFrame(restore);
+}
+
+function addComment(comment, focus = true) {
+  state.comments.set(comment.id, comment);
+  const key = viewKey(comment.repositoryId, comment.contextKey, comment.fileId);
+  state.commentCounts.set(key, (state.commentCounts.get(key) || 0) + 1);
+  if (comment.side === "file") addFileCommentElement(comment, focus);
+  else addInlineZone(comment, focus);
+  refreshActiveDecorations();
+  updateFileRow(key);
+  updateSummary();
+}
+
+function deleteComment(commentId) {
+  const comment = state.comments.get(commentId);
+  if (!comment) return;
+  const key = viewKey(comment.repositoryId, comment.contextKey, comment.fileId);
+  if (comment.side === "file") removeFileCommentElement(commentId);
+  else removeInlineZone(commentId);
+  state.comments.delete(commentId);
+  const count = Math.max(0, (state.commentCounts.get(key) || 1) - 1);
+  if (count) state.commentCounts.set(key, count);
+  else state.commentCounts.delete(key);
+  refreshActiveDecorations();
+  updateFileRow(key);
+  updateSummary();
+}
+
+function selectionLines(editor, clickedLine = null) {
+  const selection = editor.getSelection();
+  if (selection && !selection.isEmpty()) {
+    const startLine = Math.min(selection.startLineNumber, selection.endLineNumber);
+    let endLine = Math.max(selection.startLineNumber, selection.endLineNumber);
+    if (selection.endColumn === 1 && endLine > startLine) endLine -= 1;
+    if (clickedLine == null || (clickedLine >= startLine && clickedLine <= endLine)) return { startLine, endLine };
+  }
+  const line = clickedLine || editor.getPosition()?.lineNumber || 1;
+  return { startLine: line, endLine: line };
+}
+
+function addInlineComment(side, editor, clickedLine = null) {
+  const active = getActiveDetails();
+  if (!active || !canCommentOnSide(side)) return;
+  const lines = selectionLines(editor, clickedLine);
+  addComment({
+    id: `${Date.now()}:${Math.random().toString(16).slice(2)}`,
+    repositoryId: active.repository.id,
+    contextKey: active.context.key,
+    fileId: active.file.id,
+    mode: active.context.mode,
+    side,
+    startLine: lines.startLine,
+    endLine: lines.endLine,
+    body: "",
   });
 }
 
-function syncCommentBodiesFromDOM() {
-  const textareas = document.querySelectorAll("textarea[data-comment-id]");
-  textareas.forEach((textarea) => {
-    const commentId = textarea.getAttribute("data-comment-id");
-    const comment = state.comments.find((item) => item.id === commentId);
-    if (comment) comment.body = textarea.value;
+function installEditorCommentActions(editor, side, hoverCollection) {
+  let hoveredLine = null;
+  hoverResetters.push(() => {
+    hoveredLine = null;
+    hoverCollection.set([]);
   });
-}
-
-function updateCommentsUI() {
-  renderTree();
-  syncViewZones();
-  updateDecorations();
-  renderFileComments();
-}
-
-function renderAll(options = {}) {
-  renderTree();
-  submitButton.disabled = false;
-  if (diffEditor && monacoApi) {
-    mountFile(options);
-    requestAnimationFrame(() => {
-      layoutEditor();
-      setTimeout(layoutEditor, 50);
-    });
-  } else {
-    renderFileComments();
-  }
-}
-
-function createGlyphHoverActions(editor, side) {
-  let hoverDecoration = [];
-
-  function openDraftAtLine(line) {
-    const file = activeFile();
-    if (!file || !canCommentOnSide(file, side) || !isActiveFileReady()) return;
-    state.comments.push({
-      id: `${Date.now()}:${Math.random().toString(16).slice(2)}`,
-      fileId: file.id,
-      scope: state.currentScope,
-      commitSha: state.currentScope === "commit" ? state.selectedCommitSha : undefined,
-      side,
-      startLine: line,
-      endLine: line,
-      body: "",
-    });
-    updateCommentsUI();
-    editor.revealLineInCenter(line);
-  }
-
   editor.onMouseMove((event) => {
-    const file = activeFile();
-    if (!file || !canCommentOnSide(file, side) || !isActiveFileReady()) {
-      hoverDecoration = editor.deltaDecorations(hoverDecoration, []);
-      return;
-    }
-
     const target = event.target;
-    if (target.type === monacoApi.editor.MouseTargetType.GUTTER_GLYPH_MARGIN || target.type === monacoApi.editor.MouseTargetType.GUTTER_LINE_NUMBERS) {
-      const line = target.position?.lineNumber;
-      if (!line) return;
-      hoverDecoration = editor.deltaDecorations(hoverDecoration, [{
-        range: new monacoApi.Range(line, 1, line, 1),
-        options: { glyphMarginClassName: "review-glyph-plus" },
-      }]);
-    } else {
-      hoverDecoration = editor.deltaDecorations(hoverDecoration, []);
-    }
+    const inGutter = target.type === monacoApi.editor.MouseTargetType.GUTTER_GLYPH_MARGIN || target.type === monacoApi.editor.MouseTargetType.GUTTER_LINE_NUMBERS;
+    const line = inGutter && canCommentOnSide(side) ? target.position?.lineNumber || null : null;
+    if (line === hoveredLine) return;
+    hoveredLine = line;
+    hoverCollection.set(line ? [{
+      range: new monacoApi.Range(line, 1, line, 1),
+      options: { glyphMarginClassName: "review-glyph-plus" },
+    }] : []);
   });
-
   editor.onMouseLeave(() => {
-    hoverDecoration = editor.deltaDecorations(hoverDecoration, []);
+    hoveredLine = null;
+    hoverCollection.set([]);
   });
-
   editor.onMouseDown((event) => {
-    const file = activeFile();
-    if (!file || !canCommentOnSide(file, side) || !isActiveFileReady()) return;
-
     const target = event.target;
-    if (target.type === monacoApi.editor.MouseTargetType.GUTTER_GLYPH_MARGIN || target.type === monacoApi.editor.MouseTargetType.GUTTER_LINE_NUMBERS) {
-      const line = target.position?.lineNumber;
-      if (!line) return;
-      openDraftAtLine(line);
-    }
+    if (target.type !== monacoApi.editor.MouseTargetType.GUTTER_GLYPH_MARGIN && target.type !== monacoApi.editor.MouseTargetType.GUTTER_LINE_NUMBERS) return;
+    const line = target.position?.lineNumber;
+    if (line) addInlineComment(side, editor, line);
+  });
+  editor.addAction({
+    id: `add-review-comment-${side}`,
+    label: "Add review comment",
+    keybindings: [monacoApi.KeyMod.CtrlCmd | monacoApi.KeyMod.Shift | monacoApi.KeyCode.KeyM],
+    contextMenuGroupId: "review",
+    contextMenuOrder: 1,
+    run: () => addInlineComment(side, editor),
   });
 }
-
-window.__reviewReceive = function (message) {
-  if (!message || typeof message !== "object") return;
-  const previousSelectedCommitSha = state.selectedCommitSha;
-  if (message.scope === "commit" && message.commitSha) state.selectedCommitSha = message.commitSha;
-  const key = cacheKey(message.scope, message.fileId);
-  state.selectedCommitSha = previousSelectedCommitSha;
-
-  if (message.type === "file-data") {
-    state.fileContents[key] = {
-      originalContent: message.originalContent,
-      modifiedContent: message.modifiedContent,
-    };
-    delete state.fileErrors[key];
-    delete state.pendingRequestIds[key];
-    renderTree();
-    if (state.activeFileId === message.fileId && state.currentScope === message.scope && (message.scope !== "commit" || message.commitSha === state.selectedCommitSha)) {
-      mountFile({ restoreFileScroll: true });
-    }
-    return;
-  }
-
-  if (message.type === "file-error") {
-    state.fileErrors[key] = message.message || "Unknown error";
-    delete state.pendingRequestIds[key];
-    renderTree();
-    if (state.activeFileId === message.fileId && state.currentScope === message.scope && (message.scope !== "commit" || message.commitSha === state.selectedCommitSha)) {
-      mountFile({ preserveScroll: false });
-    }
-  }
-};
 
 function setupMonaco() {
-  window.require.config({
-    paths: {
-      vs: "https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.52.2/min/vs",
-    },
-  });
-
-  window.require(["vs/editor/editor.main"], function () {
+  if (!window.require?.config) {
+    showFatalError("Monaco loader did not initialize.");
+    return;
+  }
+  window.require.config({ paths: { vs: "https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.56.0/min/vs" } });
+  window.require(["vs/editor/editor.main"], () => {
     monacoApi = window.monaco;
-
     monacoApi.editor.defineTheme("review-dark", {
       base: "vs-dark",
       inherit: true,
@@ -994,10 +1339,11 @@ function setupMonaco() {
       },
     });
     monacoApi.editor.setTheme("review-dark");
-
+    originalModel = monacoApi.editor.createModel("", "plaintext");
+    modifiedModel = monacoApi.editor.createModel("", "plaintext");
     diffEditor = monacoApi.editor.createDiffEditor(editorContainerEl, {
       automaticLayout: true,
-      renderSideBySide: activeFileShowsDiff(),
+      renderSideBySide: true,
       readOnly: true,
       originalEditable: false,
       minimap: { enabled: true, renderCharacters: false, showSlider: "always", size: "proportional" },
@@ -1010,155 +1356,334 @@ function setupMonaco() {
       lineDecorationsWidth: 10,
       overviewRulerBorder: false,
       wordWrap: "on",
+      ariaLabel: "Code comparison",
     });
-
-    createGlyphHoverActions(diffEditor.getOriginalEditor(), "original");
-    createGlyphHoverActions(diffEditor.getModifiedEditor(), "modified");
-
-    if (typeof ResizeObserver !== "undefined") {
-      editorResizeObserver = new ResizeObserver(() => {
-        layoutEditor();
-      });
-      editorResizeObserver.observe(editorContainerEl);
-    }
-
-    requestAnimationFrame(() => {
-      layoutEditor();
-      setTimeout(layoutEditor, 50);
-      setTimeout(layoutEditor, 150);
+    diffEditor.setModel({ original: originalModel, modified: modifiedModel });
+    const originalEditor = diffEditor.getOriginalEditor();
+    const modifiedEditor = diffEditor.getModifiedEditor();
+    originalEditor.updateOptions({ ariaLabel: "Original file" });
+    modifiedEditor.updateOptions({ ariaLabel: "Modified file" });
+    originalDecorations = originalEditor.createDecorationsCollection();
+    modifiedDecorations = modifiedEditor.createDecorationsCollection();
+    originalHoverDecorations = originalEditor.createDecorationsCollection();
+    modifiedHoverDecorations = modifiedEditor.createDecorationsCollection();
+    installEditorCommentActions(originalEditor, "original", originalHoverDecorations);
+    installEditorCommentActions(modifiedEditor, "modified", modifiedHoverDecorations);
+    diffEditor.onDidUpdateDiff(() => {
+      if (pendingViewRestore?.key !== mountedViewKey) return;
+      diffEditor.restoreViewState(pendingViewRestore.viewState);
+      pendingViewRestore = null;
     });
-
-    mountFile();
-  });
+    mountActiveFile({ restoreSaved: true });
+  }, (error) => showFatalError(`Monaco failed to initialize.\n\n${error?.message || String(error)}`));
 }
 
-function populateCommitSelect() {
-  commitSelectEl.innerHTML = "";
-  (reviewData.commits || []).forEach((commit) => {
-    const option = document.createElement("option");
-    option.value = commit.sha;
-    option.textContent = `${commit.shortSha} ${commit.subject}`;
-    commitSelectEl.appendChild(option);
-  });
-  if (state.selectedCommitSha) commitSelectEl.value = state.selectedCommitSha;
-}
-
-function switchScope(scope) {
-  const hasScopeFiles = {
-    "git-diff": reviewData.files.some((file) => file.inGitDiff),
-    "last-commit": reviewData.files.some((file) => file.inLastCommit),
-    "commit": !!state.selectedCommitSha && reviewData.files.some((file) => file.commitComparisons?.[state.selectedCommitSha]),
-    "all-files": reviewData.files.some((file) => file.hasWorkingTreeFile),
+function openDialog(options) {
+  if (reviewDialogEl.open || dialogState) {
+    dialogQueue.push(options);
+    return;
+  }
+  const returnFocus = document.activeElement;
+  dialogState = {
+    onSave: options.onSave || null,
+    onCancel: options.onCancel || null,
+    returnFocus,
+    returnFocusKey: returnFocus?.dataset?.focusKey || null,
+    returnViewKey: currentViewKey(),
+    confirm: options.confirm === true,
+    reviewTarget: options.reviewTarget || null,
+    afterClose: null,
   };
-  if (!hasScopeFiles[scope] || state.currentScope === scope) return;
-  saveCurrentScrollPosition();
-  state.currentScope = scope;
-  renderAll({ restoreFileScroll: true });
-  const file = activeFile();
-  if (file) ensureFileLoaded(file.id, state.currentScope);
+  reviewDialogTitleEl.textContent = options.title;
+  reviewDialogDescriptionEl.textContent = options.description || "";
+  reviewDialogSaveEl.textContent = options.saveLabel || "Save";
+  reviewDialogTextEl.value = options.initialValue || "";
+  reviewDialogTextEl.hidden = options.confirm === true;
+  reviewDialogTextLabelEl.hidden = options.confirm === true;
+  reviewDialogEl.showModal();
+  if (options.confirm) reviewDialogSaveEl.focus();
+  else reviewDialogTextEl.focus();
 }
+
+function restoreDialogFocus(dialog) {
+  if (dialog.returnFocus?.isConnected) {
+    dialog.returnFocus.focus({ preventScroll: true });
+    return;
+  }
+  const treeTarget = findTreeFocusTarget(dialog.returnFocusKey);
+  if (treeTarget) {
+    treeTarget.focus({ preventScroll: true });
+    return;
+  }
+  const activeRow = state.treeRowsByViewKey.get(dialog.returnViewKey)?.[0]?.button;
+  if (activeRow?.isConnected) {
+    activeRow.focus({ preventScroll: true });
+    return;
+  }
+  if (getActiveDetails() && diffEditor) {
+    diffEditor.getModifiedEditor().focus();
+    return;
+  }
+  toggleSidebarButton.focus({ preventScroll: true });
+}
+
+function closeDialog(save) {
+  if (!dialogState) return;
+  const current = dialogState;
+  const value = reviewDialogTextEl.value.trim();
+  dialogState = null;
+  reviewDialogEl.close();
+  if (save) current.onSave?.(value);
+  else current.onCancel?.();
+  restoreDialogFocus(current);
+  queueMicrotask(() => {
+    current.afterClose?.();
+    const next = dialogQueue.shift();
+    if (next) openDialog(next);
+  });
+}
+
+function openConfirmDialog(options) {
+  openDialog({
+    title: options.title,
+    description: options.description,
+    saveLabel: options.saveLabel,
+    confirm: true,
+    onSave: options.onConfirm,
+    onCancel: options.onCancel,
+  });
+}
+
+function openOverallCommentDialog() {
+  openDialog({
+    title: "Overall review note",
+    description: "This note is included before file and line comments.",
+    initialValue: state.overallComment,
+    saveLabel: "Save note",
+    onSave: (value) => {
+      state.overallComment = value;
+      updateSummary();
+    },
+  });
+}
+
+function openFileCommentDialog() {
+  const active = getActiveDetails();
+  if (!active) return;
+  openDialog({
+    title: `File comment for ${active.file.displayPath}`,
+    description: `Applies to this file in ${active.context.mode === "compare" ? "Compare" : "Uncommitted"}.`,
+    initialValue: "",
+    saveLabel: "Add comment",
+    reviewTarget: {
+      repositoryId: active.repository.id,
+      contextKey: active.context.key,
+    },
+    onSave: (value) => {
+      if (!value) return;
+      addComment({
+        id: `${Date.now()}:${Math.random().toString(16).slice(2)}`,
+        repositoryId: active.repository.id,
+        contextKey: active.context.key,
+        fileId: active.file.id,
+        mode: active.context.mode,
+        side: "file",
+        startLine: null,
+        endLine: null,
+        body: value,
+      });
+    },
+  });
+}
+
+function syncCommentBodiesFromDOM() {
+  document.querySelectorAll("textarea[data-comment-id]").forEach((textarea) => {
+    const comment = state.comments.get(textarea.dataset.commentId);
+    if (comment) comment.body = textarea.value;
+  });
+}
+
+function toggleReviewed() {
+  const active = getActiveDetails();
+  if (!active) return;
+  if (state.reviewed.has(active.key)) state.reviewed.delete(active.key);
+  else state.reviewed.set(active.key, {
+    repositoryId: active.repository.id,
+    contextKey: active.context.key,
+    fileId: active.file.id,
+    mode: active.context.mode,
+  });
+  updateFileRow(active.key);
+  updateToolbar();
+}
+
+function handleFileData(message) {
+  const key = viewKey(message.repositoryId, message.contextKey, message.fileId);
+  const load = settleFileLoad(getLoad(key), message, "ready");
+  if (!load) return;
+  state.loads.set(key, load);
+  updateFileRow(key);
+  if (currentViewKey() === key) mountActiveFile({ preserveCurrent: true });
+}
+
+function handleFileError(message) {
+  const key = viewKey(message.repositoryId, message.contextKey, message.fileId);
+  const load = settleFileLoad(getLoad(key), message, "error");
+  if (!load) return;
+  state.loads.set(key, load);
+  updateFileRow(key);
+  if (currentViewKey() === key) mountActiveFile({ preserveCurrent: true });
+}
+
+window.__reviewReceive = function (message) {
+  if (!message || typeof message !== "object") return;
+  switch (message.type) {
+    case "workspace-data":
+      handleWorkspaceData(message);
+      break;
+    case "compare-data":
+      handleCompareData(message);
+      break;
+    case "compare-error":
+      handleCompareError(message);
+      break;
+    case "file-data":
+      handleFileData(message);
+      break;
+    case "file-error":
+      handleFileError(message);
+      break;
+  }
+};
 
 submitButton.addEventListener("click", () => {
   syncCommentBodiesFromDOM();
-  const payload = {
+  sendTerminalMessage({
     type: "submit",
     overallComment: state.overallComment.trim(),
-    comments: state.comments
+    comments: [...state.comments.values()]
       .map((comment) => ({ ...comment, body: comment.body.trim() }))
       .filter((comment) => comment.body.length > 0),
-  };
-  window.glimpse.send(payload);
-  window.glimpse.close();
-});
-
-cancelButton.addEventListener("click", () => {
-  window.glimpse.send({ type: "cancel" });
-  window.glimpse.close();
-});
-
-overallCommentButton.addEventListener("click", () => {
-  showOverallCommentModal();
-});
-
-fileCommentButton.addEventListener("click", () => {
-  showFileCommentModal();
-});
-
-toggleUnchangedButton.addEventListener("click", () => {
-  state.hideUnchanged = !state.hideUnchanged;
-  applyEditorOptions();
-  updateToggleButtons();
-  requestAnimationFrame(layoutEditor);
-});
-
-toggleWrapButton.addEventListener("click", () => {
-  state.wrapLines = !state.wrapLines;
-  applyEditorOptions();
-  updateToggleButtons();
-  requestAnimationFrame(() => {
-    layoutEditor();
-    setTimeout(layoutEditor, 50);
   });
 });
 
-toggleReviewedButton.addEventListener("click", () => {
-  const file = activeFile();
-  if (!file) return;
-  state.reviewedFiles[file.id] = !isFileReviewed(file.id);
-  renderTree();
+cancelButton.addEventListener("click", () => sendTerminalMessage({ type: "cancel" }));
+fatalCancelButton.addEventListener("click", () => sendTerminalMessage({ type: "cancel" }));
+overallCommentButton.addEventListener("click", openOverallCommentDialog);
+fileCommentButton.addEventListener("click", openFileCommentDialog);
+toggleReviewedButton.addEventListener("click", toggleReviewed);
+tabUncommittedButton.addEventListener("click", () => selectMode("uncommitted"));
+tabCompareButton.addEventListener("click", () => selectMode("compare"));
+
+toggleWrapButton.addEventListener("click", () => {
+  const anchors = captureBothEditorAnchors();
+  state.wrapLines = !state.wrapLines;
+  applyEditorOptions();
+  updateToolbar();
+  requestAnimationFrame(() => restoreBothEditorAnchors(anchors));
 });
 
-scopeDiffButton.addEventListener("click", () => {
-  switchScope("git-diff");
+toggleMinimapButton.addEventListener("click", () => {
+  const anchors = captureBothEditorAnchors();
+  state.minimap = !state.minimap;
+  applyEditorOptions();
+  updateToolbar();
+  requestAnimationFrame(() => restoreBothEditorAnchors(anchors));
 });
 
-scopeLastCommitButton.addEventListener("click", () => {
-  switchScope("last-commit");
-});
-
-scopeCommitButton.addEventListener("click", () => {
-  switchScope("commit");
-});
-
-scopeAllButton.addEventListener("click", () => {
-  switchScope("all-files");
+toggleUnchangedButton.addEventListener("click", () => {
+  const anchors = captureBothEditorAnchors();
+  state.hideUnchanged = !state.hideUnchanged;
+  applyEditorOptions();
+  updateToolbar();
+  requestAnimationFrame(() => restoreBothEditorAnchors(anchors));
 });
 
 toggleSidebarButton.addEventListener("click", () => {
   state.sidebarCollapsed = !state.sidebarCollapsed;
-  updateSidebarLayout();
-  requestAnimationFrame(() => {
-    layoutEditor();
-    setTimeout(layoutEditor, 50);
-  });
+  const width = state.sidebarCollapsed ? "0px" : "304px";
+  sidebarEl.style.width = width;
+  sidebarEl.style.minWidth = width;
+  sidebarEl.style.flexBasis = width;
+  sidebarEl.style.borderRightWidth = state.sidebarCollapsed ? "0px" : "1px";
+  sidebarEl.inert = state.sidebarCollapsed;
+  sidebarEl.setAttribute("aria-hidden", String(state.sidebarCollapsed));
+  toggleSidebarButton.textContent = state.sidebarCollapsed ? "Show sidebar" : "Hide sidebar";
+  toggleSidebarButton.setAttribute("aria-expanded", String(!state.sidebarCollapsed));
+});
+
+sidebarEl.addEventListener("transitionend", (event) => {
+  if (event.propertyName === "width") diffEditor?.layout();
+});
+
+repositoryFilterEl.addEventListener("change", () => {
+  saveActiveViewState();
+  state.repositoryFilter = repositoryFilterEl.value || "all";
+  state.active = null;
+  ensureActiveSelection();
+  renderTree();
+  mountActiveFile({ restoreSaved: true });
 });
 
 sidebarSearchInputEl.addEventListener("input", () => {
   state.fileFilter = sidebarSearchInputEl.value;
-  renderTree();
+  scheduleTreeRender();
 });
 
 sidebarSearchInputEl.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") {
-    sidebarSearchInputEl.value = "";
-    state.fileFilter = "";
-    renderTree();
+  if (event.key !== "Escape") return;
+  event.preventDefault();
+  event.stopPropagation();
+  clearFileFilter();
+});
+
+reviewDialogFormEl.addEventListener("submit", (event) => {
+  event.preventDefault();
+  closeDialog(true);
+});
+reviewDialogCancelEl.addEventListener("click", () => closeDialog(false));
+reviewDialogEl.addEventListener("cancel", (event) => {
+  event.preventDefault();
+  closeDialog(false);
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || event.defaultPrevented || state.terminalMessageSent) return;
+  if (reviewDialogEl.open) return;
+  const activeElement = document.activeElement;
+  if (activeElement === sidebarSearchInputEl) {
+    event.preventDefault();
+    event.stopPropagation();
+    clearFileFilter();
+    return;
   }
+  const commentEditor = activeElement?.closest?.("[data-comment-editor]");
+  if (commentEditor) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (activeElement?.dataset?.commentInput === "true") activeElement.blur();
+    else commentEditor.querySelector("textarea")?.focus({ preventScroll: true });
+    return;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  sendTerminalMessage({ type: "cancel" });
+}, true);
+
+window.addEventListener("error", (event) => {
+  if (!event.message) return;
+  showFatalError(event.message);
+});
+window.addEventListener("unhandledrejection", (event) => {
+  showFatalError(event.reason instanceof Error ? event.reason.message : String(event.reason));
 });
 
-commitSelectEl.addEventListener("change", () => {
-  saveCurrentScrollPosition();
-  state.selectedCommitSha = commitSelectEl.value || null;
-  if (state.currentScope !== "commit") state.currentScope = "commit";
-  state.activeFileId = null;
-  renderAll({ restoreFileScroll: true });
-  const file = activeFile();
-  if (file) ensureFileLoaded(file.id, state.currentScope);
-});
-
-populateCommitSelect();
-ensureActiveFileForScope();
+updateTabs();
+updateToolbar();
+updateSummary();
 renderTree();
-renderFileComments();
-updateSidebarLayout();
-setupMonaco();
+
+if (window.__reviewAssetErrors?.length) showFatalError(window.__reviewAssetErrors.join("\n"));
+else setupMonaco();
+
+sendToHost({ type: "ready" });

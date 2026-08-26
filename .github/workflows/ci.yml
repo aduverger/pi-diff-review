@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm pack --dry-run
+      - name: Smoke-test a production install
+        run: |
+          mkdir -p "$RUNNER_TEMP/pi-diff-review-pack" "$RUNNER_TEMP/pi-diff-review-install"
+          npm pack --pack-destination "$RUNNER_TEMP/pi-diff-review-pack"
+          cd "$RUNNER_TEMP/pi-diff-review-install"
+          npm init -y
+          npm install --omit=dev "$RUNNER_TEMP/pi-diff-review-pack"/*.tgz
+          npm ls pi-diff-review glimpseui --omit=dev

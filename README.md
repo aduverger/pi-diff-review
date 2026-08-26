@@ -1,39 +1,34 @@
 # pi-diff-review
 
-This is pure slop, see: https://pi.dev/session/#d4ce533cedbd60040f2622dc3db950e2
+Native diff review for [pi](https://pi.dev), powered by [Glimpse](https://github.com/hazat/glimpse) and Monaco.
 
-It is my hope, that someone takes this idea and makes it gud.
+## Install
 
-Native diff review window for pi, powered by [Glimpse](https://github.com/hazat/glimpse) and Monaco.
-
-```
-pi install git:https://github.com/badlogic/pi-diff-review
+```sh
+pi install git:https://github.com/aduverger/pi-diff-review
 ```
 
-## What it does
+## Usage
 
-Adds a `/diff-review` command to pi.
+Run `/diff-review` from a Git workspace. If the workspace contains one clone, it opens directly; if it contains multiple clones, select the repository to review.
 
-The command:
+The review window provides two modes:
 
-1. opens a native review window
-2. lets you switch between `git diff`, `last commit`, and `all files` scopes
-3. shows a collapsible sidebar with fuzzy file search
-4. shows git status markers in the sidebar for changed files and untracked files
-5. lazy-loads file contents on demand as you switch files and scopes
-6. lets you draft comments on the original side, modified side, or whole file
-7. inserts the resulting feedback prompt into the pi editor when you submit
+- **Uncommitted** reviews `HEAD` against the checkout, including staged, unstaged, untracked, deleted, renamed, conflicted, and type-changed files.
+- **Compare** compares editable local base/head refs from their merge base. It only uses refs already present in the selected clone and never fetches.
+
+Use the sidebar to switch files and search by path. Add comments to original or modified lines, to a whole file, or as an overall note. Submitting closes the window and inserts a structured feedback prompt into the pi editor; cancelling or closing the window discards the draft.
 
 ## Requirements
 
-- macOS, Linux, or Windows
-- Node.js 20+
-- `pi` installed
-- internet access for the Tailwind and Monaco CDNs used by the review window
+- Node.js 22.19.0 or newer
+- `pi` and Git
+- A desktop supported by Glimpse with its [platform prerequisites](https://github.com/hazat/glimpse#install)
+- Internet access while reviewing, for the Tailwind and Monaco CDN assets
 
-### Windows notes
+## Development
 
-Glimpse now supports Windows. To build the native host during install you need:
-
-- .NET 8 SDK
-- Microsoft Edge WebView2 Runtime
+```sh
+npm ci
+npm run check
+```
