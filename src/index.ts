@@ -372,8 +372,6 @@ export default function (pi: ExtensionAPI) {
             settleTerminal({ kind: "submit", payload: message });
           } else if (message.type === "cancel") {
             settleTerminal({ kind: "cancel" });
-          } else {
-            settleTerminal({ kind: "error", error: new Error(message.message) });
           }
         } catch (error) {
           settleTerminal({ kind: "error", error: new Error(errorMessage(error)) });

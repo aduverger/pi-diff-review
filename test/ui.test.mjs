@@ -73,6 +73,10 @@ test("decodes compare and submit messages into validated records", () => {
 test("rejects malformed protocol records, Git revisions, and comment ranges", () => {
   assert.throws(() => decodeReviewWindowMessage(null), /must be an object/);
   assert.throws(
+    () => decodeReviewWindowMessage({ type: "client-error", message: "Script error." }),
+    /Unknown review message type/,
+  );
+  assert.throws(
     () => decodeReviewWindowMessage({
       type: "request-compare",
       requestId: "request-a",

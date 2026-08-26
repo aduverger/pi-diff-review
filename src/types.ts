@@ -109,14 +109,6 @@ export interface ReviewReadyPayload {
   type: "ready";
 }
 
-export interface ReviewClientErrorPayload {
-  type: "client-error";
-  message: string;
-  requestId?: string;
-  repositoryId?: string;
-  contextKey?: string;
-}
-
 export interface ReviewRequestComparePayload {
   type: "request-compare";
   requestId: string;
@@ -137,7 +129,6 @@ export type ReviewWindowMessage =
   | ReviewReadyPayload
   | ReviewSubmitPayload
   | ReviewCancelPayload
-  | ReviewClientErrorPayload
   | ReviewRequestComparePayload
   | ReviewRequestFilePayload;
 

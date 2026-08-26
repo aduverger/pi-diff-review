@@ -4,7 +4,6 @@ import { fileURLToPath } from "node:url";
 import type {
   DiffReviewComment,
   ReviewCancelPayload,
-  ReviewClientErrorPayload,
   ReviewHostMessage,
   ReviewReadyPayload,
   ReviewRequestComparePayload,
@@ -140,13 +139,6 @@ export function decodeReviewWindowMessage(value: unknown): ReviewWindowMessage {
 
   if (type === "ready") {
     return { type } satisfies ReviewReadyPayload;
-  }
-
-  if (type === "client-error") {
-    return {
-      type,
-      message: readString(message, "message"),
-    } satisfies ReviewClientErrorPayload;
   }
 
   throw new Error(`Unknown review message type: ${type}`);

@@ -43,7 +43,6 @@ const state = {
   requestSequence: 0,
   initialCompareRequested: false,
   terminalMessageSent: false,
-  clientErrorSent: false,
   treeRowsByViewKey: new Map(),
 };
 
@@ -134,12 +133,6 @@ function showFatalError(message) {
   fatalMessageEl.textContent = text;
   fatalOverlayEl.hidden = false;
   rootLayoutEl.inert = true;
-  if (!state.clientErrorSent && window.glimpse?.send) {
-    state.clientErrorSent = true;
-    try {
-      window.glimpse.send({ type: "client-error", message: text });
-    } catch {}
-  }
   fatalCancelButton.focus();
 }
 
@@ -1536,23 +1529,27 @@ function handleFileError(message) {
 }
 
 window.__reviewReceive = function (message) {
-  if (!message || typeof message !== "object") return;
-  switch (message.type) {
-    case "workspace-data":
-      handleWorkspaceData(message);
-      break;
-    case "compare-data":
-      handleCompareData(message);
-      break;
-    case "compare-error":
-      handleCompareError(message);
-      break;
-    case "file-data":
-      handleFileData(message);
-      break;
-    case "file-error":
-      handleFileError(message);
-      break;
+  try {
+    if (!message || typeof message !== "object") return;
+    switch (message.type) {
+      case "workspace-data":
+        handleWorkspaceData(message);
+        break;
+      case "compare-data":
+        handleCompareData(message);
+        break;
+      case "compare-error":
+        handleCompareError(message);
+        break;
+      case "file-data":
+        handleFileData(message);
+        break;
+      case "file-error":
+        handleFileError(message);
+        break;
+    }
+  } catch (error) {
+    showFatalError(error instanceof Error ? error.stack || error.message : String(error));
   }
 };
 
@@ -1671,11 +1668,12 @@ document.addEventListener("keydown", (event) => {
 }, true);
 
 window.addEventListener("error", (event) => {
+  if (event.message === "Script error." && !event.filename && event.error == null) return;
   if (!event.message) return;
-  showFatalError(event.message);
+  showFatalError(event.error instanceof Error ? event.error.stack || event.error.message : event.message);
 });
 window.addEventListener("unhandledrejection", (event) => {
-  showFatalError(event.reason instanceof Error ? event.reason.message : String(event.reason));
+  showFatalError(event.reason instanceof Error ? event.reason.stack || event.reason.message : String(event.reason));
 });
 
 updateTabs();
